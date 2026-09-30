@@ -3,7 +3,6 @@ use std::ops::Range;
 use acp_thread::{ToolCall, ToolCallContent, ToolCallStatus};
 use agent_client_protocol::schema::v2 as acp_v2;
 
-/// How a thread entry participates in grouping finished tool calls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum EntryGrouping {
     FinishedToolCall,
@@ -46,8 +45,6 @@ fn tool_call_shows_diff(tool_call: &ToolCall) -> bool {
         })
 }
 
-/// Finds maximal runs of consecutive finished tool calls worth collapsing.
-///
 /// While the thread is still generating, the most recent tool call of a run at
 /// the end of the thread stays out of the run, so the latest result remains
 /// visible and the run only grows once the next entry arrives.
@@ -86,16 +83,15 @@ fn run_from_indices(tool_call_indices: &[usize]) -> Option<ToolCallRun> {
     })
 }
 
-/// How a thread entry participates in collapsing a finished turn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TurnEntry {
     UserMessage,
-    /// An assistant message with visible text. The last one in a turn is its
-    /// final answer, provided no further work follows it.
-    Answer { thinking_blocks: usize },
-    /// Tool calls and thought-only messages, with the number of visible steps
-    /// they render (zero for a tool call that renders nothing).
-    Work { steps: usize },
+    Answer {
+        thinking_blocks: usize,
+    },
+    Work {
+        steps: usize,
+    },
     /// Collapsed with the work when it precedes the final answer, but doesn't
     /// stop a turn from ending on its answer (e.g. context compactions).
     Aside,
@@ -106,12 +102,9 @@ pub(super) enum TurnEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CollapsibleTurn {
     pub user_message_ix: usize,
-    /// Everything between the user message and the final answer.
     pub work: Range<usize>,
     pub final_answer_ix: usize,
     pub final_answer_has_thoughts: bool,
-    /// Visible entries hidden while collapsed: tool calls, thinking blocks and
-    /// intermediate messages, with the final answer's thoughts counting as one.
     pub steps: usize,
 }
 
@@ -133,7 +126,6 @@ impl CollapsibleTurn {
         self.user_message_ix + 1
     }
 
-    /// Entries whose rendering depends on whether the turn is collapsed.
     pub fn affected_entries(&self) -> Range<usize> {
         self.summary_row_ix()..self.final_answer_ix + 1
     }
@@ -160,9 +152,6 @@ impl CollapsibleTurn {
     }
 }
 
-/// Finds finished turns that end on an answer and have work worth hiding
-/// behind a single summary row.
-///
 /// Turns that end on work (a tool call, a canceled or failed response) are
 /// left alone, so how they ended stays visible.
 pub(super) fn collapsible_turns(
@@ -353,7 +342,10 @@ mod tests {
         #[test]
         fn collapses_a_single_tool_call() {
             let entries = [UserMessage, TOOL, TEXT];
-            assert_eq!(collapsible_turns(&entries, false), vec![turn(0, 2, false, 1)]);
+            assert_eq!(
+                collapsible_turns(&entries, false),
+                vec![turn(0, 2, false, 1)]
+            );
         }
 
         #[test]
@@ -404,7 +396,10 @@ mod tests {
         #[test]
         fn only_finished_turns_collapse_while_the_last_turn_is_live() {
             let entries = [UserMessage, TOOL, TEXT, UserMessage, TOOL, TEXT];
-            assert_eq!(collapsible_turns(&entries, true), vec![turn(0, 2, false, 1)]);
+            assert_eq!(
+                collapsible_turns(&entries, true),
+                vec![turn(0, 2, false, 1)]
+            );
             assert_eq!(
                 collapsible_turns(&entries, false),
                 vec![turn(0, 2, false, 1), turn(3, 5, false, 1)]
@@ -489,7 +484,10 @@ mod tests {
         #[test]
         fn ignores_entries_before_the_first_user_message() {
             let entries = [TOOL, TEXT, UserMessage, TOOL, TEXT];
-            assert_eq!(collapsible_turns(&entries, false), vec![turn(2, 4, false, 1)]);
+            assert_eq!(
+                collapsible_turns(&entries, false),
+                vec![turn(2, 4, false, 1)]
+            );
         }
     }
 }

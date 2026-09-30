@@ -6274,9 +6274,7 @@ impl ThreadView {
         self.finished_turns = turns;
     }
 
-    /// When following the tail the list stays pinned to the final answer.
-    /// Otherwise a scroll position inside the collapsed work would land past
-    /// the summary row, so move it to the row instead.
+    /// A scroll position inside collapsed work would otherwise land past the summary row.
     fn keep_scroll_position_out_of_collapsed_turn(&self, turn: &CollapsibleTurn) {
         if self.list_state.is_following_tail() {
             return;
@@ -6383,8 +6381,7 @@ impl ThreadView {
             .entry_view_state
             .read(cx)
             .is_tool_call_group_expanded(first_tool_call_id);
-        // Keep the clicked row in place instead of jumping to the end of the
-        // newly revealed cards.
+        // Keep the clicked row in place instead of snapping to the end.
         if self.list_state.is_following_tail() && !is_expanded {
             self.list_state.pause_following_tail();
         }
@@ -6444,7 +6441,11 @@ impl ThreadView {
                     .rounded_sm()
                     .cursor_pointer()
                     .hover(|style| style.bg(cx.theme().colors().element_hover))
-                    .child(Icon::new(chevron).size(IconSize::XSmall).color(Color::Muted))
+                    .child(
+                        Icon::new(chevron)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
                     .child(
                         Label::new(label)
                             .size(LabelSize::Custom(self.tool_name_font_size()))
@@ -6455,7 +6456,6 @@ impl ThreadView {
             .into_any_element()
     }
 
-    /// Returns `None` for tool calls that shouldn't be shown at all.
     fn render_standalone_tool_call(
         &self,
         entry_ix: usize,
@@ -6822,11 +6822,7 @@ impl ThreadView {
                         .is_expanded
                         .then(|| self.render_standalone_tool_call(entry_ix, tool_call, window, cx))
                         .flatten();
-                    v_flex()
-                        .w_full()
-                        .children(header)
-                        .children(card)
-                        .into_any()
+                    v_flex().w_full().children(header).children(card).into_any()
                 }
                 None => {
                     let Some(card) =

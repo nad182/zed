@@ -111,9 +111,9 @@ pub(crate) const DRAFT_PROMPT_PERSIST_DEBOUNCE: Duration = Duration::from_millis
 
 pub(crate) mod elicitation;
 mod message_queue;
+mod thread_collapse;
 mod thread_search_bar;
 mod thread_view;
-mod thread_collapse;
 pub use message_queue::*;
 pub use thread_view::*;
 
@@ -8808,9 +8808,7 @@ pub(crate) mod tests {
                     .kind(acp_v1::ToolKind::Read)
                     .status(acp_v1::ToolCallStatus::Completed),
             ),
-            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
-                "All done.".into(),
-            )),
+            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new("All done.".into())),
         ]);
         let (conversation_view, cx) =
             setup_conversation_view(StubAgentServer::new(connection), cx).await;
@@ -8866,9 +8864,7 @@ pub(crate) mod tests {
         let thread_view = active_thread(&conversation_view, cx);
         let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
 
-        let finished_read = |id: &str| {
-            json!({"toolCallId": id, "title": "Read file", "kind": "read", "status": "completed"})
-        };
+        let finished_read = |id: &str| json!({"toolCallId": id, "title": "Read file", "kind": "read", "status": "completed"});
         let updates = [
             finished_read("read-1"),
             finished_read("read-2"),

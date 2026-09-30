@@ -49,10 +49,7 @@ pub struct EntryViewState {
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
     expanded_compactions: HashSet<usize>,
     expanded_tool_calls: HashSet<acp_v1::ToolCallId>,
-    /// Keyed by the id of each group's first tool call, which stays stable as
-    /// the group grows, unlike entry indices.
     expanded_tool_call_groups: HashSet<acp_v1::ToolCallId>,
-    /// Keyed by the index of the turn's user message.
     expanded_turns: HashSet<usize>,
     turn_durations: HashMap<usize, Duration>,
 }
