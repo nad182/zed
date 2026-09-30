@@ -359,6 +359,14 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub expand_terminal_card: Option<bool>,
+    /// Whether to collapse the work of finished turns in the agent panel. Once a turn
+    /// ends, everything before its final answer (messages, thinking, tool calls and
+    /// edits) collapses into a single "Worked for …" row that can be expanded. Within
+    /// expanded and in-progress turns, runs of consecutive finished tool calls collapse
+    /// into a single expandable row; tool calls that show a diff stay visible there.
+    ///
+    /// Default: false
+    pub collapse_finished_turns: Option<bool>,
     /// Command to automatically run when Zed creates a Terminal Thread shell in the agent panel.
     /// The command is sent to the shell as if typed, so it is interpreted by your
     /// configured shell (including on Windows and remote/WSL projects).

@@ -9005,6 +9005,29 @@ fn ai_page(cx: &App) -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
+                title: "Collapse Finished Turns",
+                description: "Whether to collapse everything before the final answer of a finished turn into a single expandable row, and to group runs of consecutive finished tool calls while a turn is in progress.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.collapse_finished_turns"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .collapse_finished_turns
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .collapse_finished_turns = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
                 title: "Terminal Thread Init Command",
                 description: "Command to automatically run when Zed creates a Terminal Thread shell in the agent panel. Runs in your configured shell.",
                 field: Box::new(SettingField {

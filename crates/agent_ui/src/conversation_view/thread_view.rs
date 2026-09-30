@@ -50,6 +50,10 @@ use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
 use super::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
 };
+use super::thread_collapse::{
+    CollapsibleTurn, EntryGrouping, ToolCallRun, TurnEntry, TurnEntryContent, collapsible_turns,
+    finished_tool_call_runs, tool_call_is_groupable,
+};
 use super::*;
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
@@ -589,6 +593,8 @@ pub struct ThreadView {
     pub last_token_limit_telemetry: Option<acp_thread::TokenUsageRatio>,
     thread_feedback: ThreadFeedbackState,
     pub list_state: ListState,
+    tool_call_groups: Vec<ToolCallGroup>,
+    finished_turns: Vec<FinishedTurn>,
     pub session_capabilities: SharedSessionCapabilities,
     pub expanded_tool_call_raw_inputs: HashSet<acp_v1::ToolCallId>,
     collapsed_sandbox_authorization_details: HashSet<acp_v1::ToolCallId>,
@@ -1000,6 +1006,8 @@ impl ThreadView {
             model_selector,
             profile_selector,
             list_state,
+            tool_call_groups: Vec::new(),
+            finished_turns: Vec::new(),
             session_capabilities,
             resumed_without_history,
             _subscriptions: subscriptions,
@@ -1421,7 +1429,7 @@ impl ThreadView {
         generation
     }
 
-    pub fn stop_turn(&mut self, generation: usize, _cx: &mut Context<Self>) {
+    pub fn stop_turn(&mut self, generation: usize, cx: &mut Context<Self>) {
         if self.turn_fields.turn_generation != generation {
             return;
         }
@@ -1430,6 +1438,19 @@ impl ThreadView {
             .turn_started_at
             .take()
             .map(|started| started.elapsed());
+        let user_message_ix = self
+            .thread
+            .read(cx)
+            .entries()
+            .iter()
+            .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)));
+        if let Some((user_message_ix, duration)) =
+            user_message_ix.zip(self.turn_fields.last_turn_duration)
+        {
+            self.entry_view_state.update(cx, |state, _cx| {
+                state.set_turn_duration(user_message_ix, duration);
+            });
+        }
         self.turn_fields.last_turn_tokens = self.turn_fields.turn_tokens.take();
         self.turn_fields._turn_timer_task = None;
     }
@@ -6071,8 +6092,408 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ToolCallGroup {
+    pub(super) run: ToolCallRun,
+    pub(super) first_tool_call_id: acp_v1::ToolCallId,
+    pub(super) is_expanded: bool,
+}
+
+fn entry_grouping(entry: &AgentThreadEntry, cx: &App) -> EntryGrouping {
+    match entry {
+        AgentThreadEntry::ToolCall(tool_call) if tool_call_is_groupable(tool_call) => {
+            EntryGrouping::FinishedToolCall
+        }
+        AgentThreadEntry::AssistantMessage(message)
+            if !message.chunks.iter().any(|chunk| match chunk {
+                AssistantMessageChunk::Message { block, .. }
+                | AssistantMessageChunk::Thought { block, .. } => block.visible_content(cx),
+            }) =>
+        {
+            EntryGrouping::Invisible
+        }
+        _ => EntryGrouping::Barrier,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FinishedTurn {
+    pub(super) turn: CollapsibleTurn,
+    pub(super) is_expanded: bool,
+    pub(super) duration: Option<Duration>,
+}
+
+fn turn_entry(entry: &AgentThreadEntry, thread: &AcpThread, cx: &App) -> TurnEntry {
+    match entry {
+        AgentThreadEntry::UserMessage(_) => TurnEntry::UserMessage,
+        AgentThreadEntry::AssistantMessage(message) => {
+            let mut has_text = false;
+            let mut thinking_blocks = 0;
+            for chunk in &message.chunks {
+                match chunk {
+                    AssistantMessageChunk::Message { block, .. } => {
+                        has_text |= block.visible_content(cx);
+                    }
+                    AssistantMessageChunk::Thought { block, .. } => {
+                        thinking_blocks += usize::from(block.visible_content(cx));
+                    }
+                }
+            }
+            if has_text {
+                TurnEntry::Answer { thinking_blocks }
+            } else if thinking_blocks > 0 {
+                TurnEntry::Work {
+                    steps: thinking_blocks,
+                }
+            } else {
+                TurnEntry::Invisible
+            }
+        }
+        AgentThreadEntry::ToolCall(tool_call) if tool_call.authorization().is_some() => {
+            TurnEntry::NeedsAction
+        }
+        AgentThreadEntry::ToolCall(tool_call) => TurnEntry::Work {
+            steps: usize::from(!tool_call_renders_nothing(tool_call, cx)),
+        },
+        AgentThreadEntry::Elicitation(elicitation_id) => match thread.elicitation(elicitation_id) {
+            Some((_, elicitation))
+                if matches!(elicitation.status, ElicitationStatus::Pending { .. }) =>
+            {
+                TurnEntry::NeedsAction
+            }
+            Some((_, elicitation)) if should_render_elicitation(elicitation) => TurnEntry::Aside,
+            _ => TurnEntry::Invisible,
+        },
+        AgentThreadEntry::ContextCompaction(_) => TurnEntry::Aside,
+    }
+}
+
+/// A canceled tool call that produced visible output is still worth showing,
+/// but one canceled before producing anything would just be a useless
+/// "Canceled" card, so it's hidden entirely.
+fn tool_call_renders_nothing(tool_call: &ToolCall, cx: &App) -> bool {
+    matches!(tool_call.status(), ToolCallStatus::Canceled)
+        && !tool_call.content().iter().any(|content| match content {
+            ToolCallContent::ContentBlock { block, .. } => block.visible_content(cx),
+            ToolCallContent::Diff(_)
+            | ToolCallContent::LegacyDiff { .. }
+            | ToolCallContent::Terminal { .. } => true,
+            ToolCallContent::DiffPatch { render, .. } => {
+                !render.files.is_empty()
+                    || render
+                        .fallback
+                        .as_ref()
+                        .is_some_and(|markdown| !markdown.read(cx).source().is_empty())
+            }
+            ToolCallContent::Other { markdown, .. } => !markdown.read(cx).source().is_empty(),
+        })
+}
+
 impl ThreadView {
+    pub(super) fn compute_tool_call_groups(&self, cx: &App) -> Vec<ToolCallGroup> {
+        if !AgentSettings::get_global(cx).collapse_finished_turns {
+            return Vec::new();
+        }
+        let thread = self.thread.read(cx);
+        let entries = thread.entries();
+        let groupings = entries
+            .iter()
+            .map(|entry| entry_grouping(entry, cx))
+            .collect::<Vec<_>>();
+        let tail_is_growing = matches!(thread.status(), ThreadStatus::Generating);
+        let entry_view_state = self.entry_view_state.read(cx);
+
+        finished_tool_call_runs(&groupings, tail_is_growing)
+            .into_iter()
+            .filter_map(|run| {
+                let AgentThreadEntry::ToolCall(first_tool_call) = entries.get(run.entries.start)?
+                else {
+                    return None;
+                };
+                let first_tool_call_id = first_tool_call.id.clone();
+                Some(ToolCallGroup {
+                    is_expanded: entry_view_state.is_tool_call_group_expanded(&first_tool_call_id),
+                    first_tool_call_id,
+                    run,
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn compute_finished_turns(&self, cx: &App) -> Vec<FinishedTurn> {
+        if !AgentSettings::get_global(cx).collapse_finished_turns {
+            return Vec::new();
+        }
+        let thread = self.thread.read(cx);
+        let turn_entries = thread
+            .entries()
+            .iter()
+            .map(|entry| turn_entry(entry, thread, cx))
+            .collect::<Vec<_>>();
+        let last_turn_is_live = matches!(thread.status(), ThreadStatus::Generating)
+            || thread.is_waiting_for_confirmation()
+            || self.has_pending_request_elicitation(cx);
+        let entry_view_state = self.entry_view_state.read(cx);
+
+        collapsible_turns(&turn_entries, last_turn_is_live)
+            .into_iter()
+            .map(|turn| FinishedTurn {
+                is_expanded: entry_view_state.is_turn_expanded(turn.user_message_ix),
+                duration: entry_view_state.turn_duration(turn.user_message_ix),
+                turn,
+            })
+            .collect()
+    }
+
+    fn sync_finished_turns(&mut self, cx: &App) {
+        let turns = self.compute_finished_turns(cx);
+        if turns == self.finished_turns {
+            return;
+        }
+        let removed = self
+            .finished_turns
+            .iter()
+            .filter(|turn| !turns.contains(turn));
+        let added = turns
+            .iter()
+            .filter(|turn| !self.finished_turns.contains(turn));
+        for turn in removed.chain(added) {
+            self.list_state
+                .remeasure_items(turn.turn.affected_entries());
+        }
+        let newly_collapsed = turns.iter().filter(|turn| {
+            !turn.is_expanded
+                && !self.finished_turns.iter().any(|previous| {
+                    previous.turn.user_message_ix == turn.turn.user_message_ix
+                        && !previous.is_expanded
+                })
+        });
+        for turn in newly_collapsed {
+            self.keep_scroll_position_out_of_collapsed_turn(&turn.turn);
+        }
+        self.finished_turns = turns;
+    }
+
+    /// When following the tail the list stays pinned to the final answer.
+    /// Otherwise a scroll position inside the collapsed work would land past
+    /// the summary row, so move it to the row instead.
+    fn keep_scroll_position_out_of_collapsed_turn(&self, turn: &CollapsibleTurn) {
+        if self.list_state.is_following_tail() {
+            return;
+        }
+        let scroll_top = self.list_state.logical_scroll_top();
+        if turn.affected_entries().contains(&scroll_top.item_ix) {
+            self.list_state.scroll_to(ListOffset {
+                item_ix: turn.summary_row_ix(),
+                offset_in_item: px(0.),
+            });
+        }
+    }
+
+    fn finished_turn_at(&self, entry_ix: usize) -> Option<&FinishedTurn> {
+        self.finished_turns
+            .iter()
+            .find(|turn| turn.turn.affected_entries().contains(&entry_ix))
+    }
+
+    fn toggle_turn(&mut self, user_message_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // Keep the clicked row in place instead of snapping to the end.
+        self.list_state.pause_following_tail();
+        self.entry_view_state.update(cx, |state, _cx| {
+            state.toggle_turn_expansion(user_message_ix);
+        });
+        self.refresh_thread_search(window, cx);
+        cx.notify();
+    }
+
+    fn render_turn_summary(&self, turn: &FinishedTurn, cx: &Context<Self>) -> AnyElement {
+        let steps = turn.turn.steps;
+        let label = match turn.duration {
+            Some(duration) => format!("Worked for {}", duration_alt_display(duration)),
+            None if steps > 0 => format!("Worked · {steps} {}", pluralize("step", steps)),
+            None => "Worked".to_string(),
+        };
+        let user_message_ix = turn.turn.user_message_ix;
+        self.render_disclosure_row(
+            ("turn-summary", user_message_ix),
+            label,
+            turn.is_expanded,
+            cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                this.toggle_turn(user_message_ix, window, cx);
+            }),
+            cx,
+        )
+    }
+
+    /// Grouping changes the height of every entry in a group, but the list only
+    /// re-measures items it lays out, so off-screen members must be invalidated.
+    fn sync_tool_call_groups(&mut self, cx: &App) {
+        let groups = self.compute_tool_call_groups(cx);
+        if groups == self.tool_call_groups {
+            return;
+        }
+        let removed = self
+            .tool_call_groups
+            .iter()
+            .filter(|group| !groups.contains(group));
+        let added = groups
+            .iter()
+            .filter(|group| !self.tool_call_groups.contains(group));
+        for group in removed.chain(added) {
+            self.list_state.remeasure_items(group.run.entries.clone());
+        }
+        self.tool_call_groups = groups;
+    }
+
+    fn tool_call_group_at(&self, entry_ix: usize) -> Option<&ToolCallGroup> {
+        self.tool_call_groups
+            .iter()
+            .find(|group| group.run.entries.contains(&entry_ix))
+    }
+
+    fn reveal_collapsed_entry(&mut self, entry_ix: usize, cx: &mut Context<Self>) {
+        if let Some(turn) = self
+            .finished_turn_at(entry_ix)
+            .filter(|turn| !turn.is_expanded && turn.turn.hides_entry(entry_ix))
+        {
+            let user_message_ix = turn.turn.user_message_ix;
+            self.entry_view_state.update(cx, |state, _cx| {
+                state.expand_turn(user_message_ix);
+            });
+        }
+        let Some(group) = self
+            .tool_call_group_at(entry_ix)
+            .filter(|group| !group.is_expanded)
+        else {
+            return;
+        };
+        let first_tool_call_id = group.first_tool_call_id.clone();
+        self.entry_view_state.update(cx, |state, _cx| {
+            state.expand_tool_call_group(first_tool_call_id);
+        });
+    }
+
+    fn toggle_tool_call_group(
+        &mut self,
+        first_tool_call_id: &acp_v1::ToolCallId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let is_expanded = self
+            .entry_view_state
+            .read(cx)
+            .is_tool_call_group_expanded(first_tool_call_id);
+        // Keep the clicked row in place instead of jumping to the end of the
+        // newly revealed cards.
+        if self.list_state.is_following_tail() && !is_expanded {
+            self.list_state.pause_following_tail();
+        }
+        self.entry_view_state.update(cx, |state, _cx| {
+            state.toggle_tool_call_group_expansion(first_tool_call_id);
+        });
+        self.refresh_thread_search(window, cx);
+        cx.notify();
+    }
+
+    fn render_tool_call_group_header(
+        &self,
+        entry_ix: usize,
+        group: &ToolCallGroup,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let label = format!(
+            "{} {}",
+            group.run.tool_call_count,
+            pluralize("tool call", group.run.tool_call_count)
+        );
+        let first_tool_call_id = group.first_tool_call_id.clone();
+        self.render_disclosure_row(
+            ("tool-call-group", entry_ix),
+            label,
+            group.is_expanded,
+            cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                this.toggle_tool_call_group(&first_tool_call_id, window, cx);
+            }),
+            cx,
+        )
+    }
+
+    fn render_disclosure_row(
+        &self,
+        id: impl Into<ElementId>,
+        label: String,
+        is_expanded: bool,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let chevron = if is_expanded {
+            IconName::ChevronDown
+        } else {
+            IconName::ChevronRight
+        };
+
+        div()
+            .px_5()
+            .my_1()
+            .child(
+                h_flex()
+                    .id(id)
+                    .px_1()
+                    .py_0p5()
+                    .gap_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    .child(Icon::new(chevron).size(IconSize::XSmall).color(Color::Muted))
+                    .child(
+                        Label::new(label)
+                            .size(LabelSize::Custom(self.tool_name_font_size()))
+                            .color(Color::Muted),
+                    )
+                    .on_click(on_click),
+            )
+            .into_any_element()
+    }
+
+    /// Returns `None` for tool calls that shouldn't be shown at all.
+    fn render_standalone_tool_call(
+        &self,
+        entry_ix: usize,
+        tool_call: &ToolCall,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        if tool_call_renders_nothing(tool_call, cx) {
+            return None;
+        }
+
+        let tool_call = self.render_any_tool_call(
+            self.thread.read(cx).session_id(),
+            entry_ix,
+            tool_call,
+            &self.focus_handle(cx),
+            ToolCallLayout::Standalone,
+            window,
+            cx,
+        );
+
+        Some(
+            if let Some(handle) = self
+                .entry_view_state
+                .read(cx)
+                .entry(entry_ix)
+                .and_then(|entry| entry.focus_handle(cx))
+            {
+                tool_call.track_focus(&handle).into_any()
+            } else {
+                tool_call.into_any()
+            },
+        )
+    }
+
     fn render_entries(&mut self, cx: &mut Context<Self>) -> List {
+        self.sync_finished_turns(cx);
+        self.sync_tool_call_groups(cx);
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let centered_container = move |content: AnyElement| {
             h_flex().w_full().justify_center().child(
@@ -6120,6 +6541,20 @@ impl ThreadView {
                 .entries()
                 .get(entry_ix.saturating_sub(1))
                 .is_none_or(|entry| !entry.is_indented());
+
+        let turn_layout = self.finished_turn_at(entry_ix).and_then(|turn| {
+            turn.turn
+                .entry_layout(entry_ix, turn.is_expanded)
+                .map(|layout| (turn, layout))
+        });
+        let turn_summary = turn_layout
+            .filter(|(_, layout)| layout.shows_turn_summary)
+            .map(|(turn, _)| self.render_turn_summary(turn, cx));
+        let content = turn_layout.map(|(_, layout)| layout.content);
+        if content == Some(TurnEntryContent::Hidden) {
+            return turn_summary.unwrap_or_else(|| Empty.into_any());
+        }
+        let hide_thoughts = content == Some(TurnEntryContent::AnswerWithoutThoughts);
 
         let mut assistant_message_is_blank = false;
 
@@ -6342,6 +6777,7 @@ impl ThreadView {
                                         .into_any_element()
                                 })
                             }
+                            AssistantMessageChunk::Thought { .. } if hide_thoughts => None,
                             AssistantMessageChunk::Thought { block, .. } => {
                                 let this_is_blank = !block.visible_content(cx);
                                 is_blank = is_blank && this_is_blank;
@@ -6378,55 +6814,29 @@ impl ThreadView {
                         .into_any()
                 }
             }
-            AgentThreadEntry::ToolCall(tool_call) => {
-                // A canceled tool call that produced visible output is still worth
-                // showing, but one that was canceled before producing anything just
-                // renders as a useless "Canceled" card — hide those entirely.
-                if matches!(tool_call.status(), ToolCallStatus::Canceled) {
-                    let has_visible_content =
-                        tool_call.content().iter().any(|content| match content {
-                            ToolCallContent::ContentBlock { block, .. } => {
-                                block.visible_content(cx)
-                            }
-                            ToolCallContent::Diff(_)
-                            | ToolCallContent::LegacyDiff { .. }
-                            | ToolCallContent::Terminal { .. } => true,
-                            ToolCallContent::DiffPatch { render, .. } => {
-                                !render.files.is_empty()
-                                    || render.fallback.as_ref().is_some_and(|markdown| {
-                                        !markdown.read(cx).source().is_empty()
-                                    })
-                            }
-                            ToolCallContent::Other { markdown, .. } => {
-                                !markdown.read(cx).source().is_empty()
-                            }
-                        });
-                    if !has_visible_content {
+            AgentThreadEntry::ToolCall(tool_call) => match self.tool_call_group_at(entry_ix) {
+                Some(group) => {
+                    let header = (group.run.entries.start == entry_ix)
+                        .then(|| self.render_tool_call_group_header(entry_ix, group, cx));
+                    let card = group
+                        .is_expanded
+                        .then(|| self.render_standalone_tool_call(entry_ix, tool_call, window, cx))
+                        .flatten();
+                    v_flex()
+                        .w_full()
+                        .children(header)
+                        .children(card)
+                        .into_any()
+                }
+                None => {
+                    let Some(card) =
+                        self.render_standalone_tool_call(entry_ix, tool_call, window, cx)
+                    else {
                         return Empty.into_any();
-                    }
+                    };
+                    card
                 }
-
-                let tool_call = self.render_any_tool_call(
-                    self.thread.read(cx).session_id(),
-                    entry_ix,
-                    tool_call,
-                    &self.focus_handle(cx),
-                    ToolCallLayout::Standalone,
-                    window,
-                    cx,
-                );
-
-                if let Some(handle) = self
-                    .entry_view_state
-                    .read(cx)
-                    .entry(entry_ix)
-                    .and_then(|entry| entry.focus_handle(cx))
-                {
-                    tool_call.track_focus(&handle).into_any()
-                } else {
-                    tool_call.into_any()
-                }
-            }
+            },
             AgentThreadEntry::Elicitation(elicitation_id) => {
                 let thread = self.thread.read(cx);
                 if let Some((_, elicitation)) = thread.elicitation(elicitation_id)
@@ -6451,6 +6861,15 @@ impl ThreadView {
             AgentThreadEntry::ContextCompaction(compaction) => {
                 self.render_context_compaction(entry_ix, compaction, window, cx)
             }
+        };
+
+        let primary = match turn_summary {
+            Some(turn_summary) => v_flex()
+                .w_full()
+                .child(turn_summary)
+                .child(primary)
+                .into_any_element(),
+            None => primary,
         };
 
         let is_subagent_output = self.is_subagent()
@@ -7188,6 +7607,7 @@ impl ThreadView {
                     let view = view.clone();
                     cx.defer(move |cx| {
                         view.update(cx, |this, cx| {
+                            this.reveal_collapsed_entry(entry_ix, cx);
                             this.list_state.scroll_to(gpui::ListOffset {
                                 item_ix: entry_ix,
                                 offset_in_item: gpui::px(0.),

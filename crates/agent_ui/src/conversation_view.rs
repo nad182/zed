@@ -113,6 +113,7 @@ pub(crate) mod elicitation;
 mod message_queue;
 mod thread_search_bar;
 mod thread_view;
+mod thread_collapse;
 pub use message_queue::*;
 pub use thread_view::*;
 
@@ -8783,6 +8784,155 @@ pub(crate) mod tests {
                 Some(original_editor),
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_finished_turn_collapses_work_before_final_answer(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    collapse_finished_turns: true,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![
+            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                "Let me look.".into(),
+            )),
+            acp_v1::SessionUpdate::ToolCall(
+                acp_v1::ToolCall::new("read", "Read file")
+                    .kind(acp_v1::ToolKind::Read)
+                    .status(acp_v1::ToolCallStatus::Completed),
+            ),
+            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                "All done.".into(),
+            )),
+        ]);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Check the file", window, cx);
+        });
+        let thread_view = active_thread(&conversation_view, cx);
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        let turn_summaries = |cx: &mut VisualTestContext| {
+            thread_view.read_with(cx, |view, cx| {
+                view.compute_finished_turns(cx)
+                    .into_iter()
+                    .map(|turn| {
+                        (
+                            turn.turn.work,
+                            turn.turn.final_answer_ix,
+                            turn.is_expanded,
+                            turn.duration.is_some(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(turn_summaries(cx), vec![(1..3, 3, false, true)]);
+
+        thread_view.update(cx, |view, cx| {
+            view.entry_view_state.update(cx, |state, _| {
+                state.toggle_turn_expansion(0);
+            });
+        });
+        assert_eq!(turn_summaries(cx), vec![(1..3, 3, true, true)]);
+    }
+
+    #[gpui::test]
+    async fn test_finished_tool_calls_are_grouped_around_diffs(cx: &mut TestAppContext) {
+        use agent_client_protocol::schema::v2 as acp_v2;
+
+        init_test(cx);
+        cx.update(|cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    collapse_finished_turns: true,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+
+        let finished_read = |id: &str| {
+            json!({"toolCallId": id, "title": "Read file", "kind": "read", "status": "completed"})
+        };
+        let updates = [
+            finished_read("read-1"),
+            finished_read("read-2"),
+            finished_read("read-3"),
+            json!({
+                "toolCallId": "edit",
+                "title": "Edit file",
+                "kind": "edit",
+                "status": "completed",
+                "content": [{
+                    "type": "diff",
+                    "changes": [{"operation": "modify", "path": "/tmp/grouped"}],
+                    "patch": {
+                        "format": "git_patch",
+                        "text": "diff --git a//tmp/grouped b//tmp/grouped\n--- a//tmp/grouped\n+++ b//tmp/grouped\n@@ -1 +1 @@\n-old\n+new\n"
+                    }
+                }]
+            }),
+            finished_read("read-4"),
+            json!({"toolCallId": "running", "title": "Read file", "kind": "read", "status": "in_progress"}),
+            finished_read("read-5"),
+        ];
+        for update in updates {
+            let update: acp_v2::ToolCallUpdate =
+                serde_json::from_value(update).expect("tool call should deserialize");
+            thread
+                .update(cx, |thread, cx| thread.upsert_tool_call_patch(update, cx))
+                .expect("tool call should apply");
+        }
+        cx.run_until_parked();
+
+        let group_summaries = |cx: &mut VisualTestContext| {
+            thread_view.read_with(cx, |view, cx| {
+                view.compute_tool_call_groups(cx)
+                    .into_iter()
+                    .map(|group| {
+                        (
+                            group.run.entries,
+                            group.run.tool_call_count,
+                            group.is_expanded,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(group_summaries(cx), vec![(0..3, 3, false)]);
+
+        thread_view.update(cx, |view, cx| {
+            view.entry_view_state.update(cx, |state, _| {
+                state.toggle_tool_call_group_expansion(&acp_v1::ToolCallId::new("read-1"));
+            });
+        });
+        assert_eq!(group_summaries(cx), vec![(0..3, 3, true)]);
+
+        cx.update(|_, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    collapse_finished_turns: false,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+        assert_eq!(group_summaries(cx), vec![]);
     }
 
     #[gpui::test]

@@ -1,4 +1,4 @@
-use std::{ops::Range, sync::Arc};
+use std::{ops::Range, sync::Arc, time::Duration};
 
 use acp_thread::{AcpThread, AgentThreadEntry, AssistantMessageChunk, ToolCall};
 use agent::ThreadStore;
@@ -49,6 +49,12 @@ pub struct EntryViewState {
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
     expanded_compactions: HashSet<usize>,
     expanded_tool_calls: HashSet<acp_v1::ToolCallId>,
+    /// Keyed by the id of each group's first tool call, which stays stable as
+    /// the group grows, unlike entry indices.
+    expanded_tool_call_groups: HashSet<acp_v1::ToolCallId>,
+    /// Keyed by the index of the turn's user message.
+    expanded_turns: HashSet<usize>,
+    turn_durations: HashMap<usize, Duration>,
 }
 
 impl EntryViewState {
@@ -71,6 +77,9 @@ impl EntryViewState {
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
+            expanded_tool_call_groups: HashSet::default(),
+            expanded_turns: HashSet::default(),
+            turn_durations: HashMap::default(),
         }
     }
 
@@ -94,6 +103,49 @@ impl EntryViewState {
         if !self.expanded_tool_calls.remove(tool_call_id) {
             self.expanded_tool_calls.insert(tool_call_id.clone());
         }
+    }
+
+    pub(crate) fn is_tool_call_group_expanded(
+        &self,
+        first_tool_call_id: &acp_v1::ToolCallId,
+    ) -> bool {
+        self.expanded_tool_call_groups.contains(first_tool_call_id)
+    }
+
+    pub(crate) fn expand_tool_call_group(&mut self, first_tool_call_id: acp_v1::ToolCallId) {
+        self.expanded_tool_call_groups.insert(first_tool_call_id);
+    }
+
+    pub(crate) fn toggle_tool_call_group_expansion(
+        &mut self,
+        first_tool_call_id: &acp_v1::ToolCallId,
+    ) {
+        if !self.expanded_tool_call_groups.remove(first_tool_call_id) {
+            self.expanded_tool_call_groups
+                .insert(first_tool_call_id.clone());
+        }
+    }
+
+    pub(crate) fn is_turn_expanded(&self, user_message_ix: usize) -> bool {
+        self.expanded_turns.contains(&user_message_ix)
+    }
+
+    pub(crate) fn expand_turn(&mut self, user_message_ix: usize) {
+        self.expanded_turns.insert(user_message_ix);
+    }
+
+    pub(crate) fn toggle_turn_expansion(&mut self, user_message_ix: usize) {
+        if !self.expanded_turns.remove(&user_message_ix) {
+            self.expanded_turns.insert(user_message_ix);
+        }
+    }
+
+    pub(crate) fn turn_duration(&self, user_message_ix: usize) -> Option<Duration> {
+        self.turn_durations.get(&user_message_ix).copied()
+    }
+
+    pub(crate) fn set_turn_duration(&mut self, user_message_ix: usize, duration: Duration) {
+        self.turn_durations.insert(user_message_ix, duration);
     }
 
     pub(crate) fn is_compaction_expanded(&self, entry_ix: usize) -> bool {
@@ -500,6 +552,18 @@ impl EntryViewState {
             .expanded_compactions
             .iter()
             .filter_map(|&entry_ix| reindex_after_removal(entry_ix, &range))
+            .collect();
+        self.expanded_turns = self
+            .expanded_turns
+            .iter()
+            .filter_map(|&entry_ix| reindex_after_removal(entry_ix, &range))
+            .collect();
+        self.turn_durations = self
+            .turn_durations
+            .iter()
+            .filter_map(|(&entry_ix, &duration)| {
+                reindex_after_removal(entry_ix, &range).map(|entry_ix| (entry_ix, duration))
+            })
             .collect();
         self.expanded_thinking_blocks = self
             .expanded_thinking_blocks
