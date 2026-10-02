@@ -1339,7 +1339,9 @@ impl ConversationView {
             for ix in 0..count {
                 view_state.sync_entry(ix, &thread, window, cx);
             }
-            view_state.sync_presentation(&thread, cx);
+            let pending_elicitation =
+                thread_collapse::has_pending_request_elicitation(thread.read(cx), cx);
+            view_state.sync_presentation(&thread, pending_elicitation, cx);
             list_state.splice_focusable(
                 0..0,
                 (0..count).map(|ix| view_state.entry(ix)?.focus_handle(cx)),
@@ -1686,6 +1688,10 @@ impl ConversationView {
             AcpThreadEvent::NewEntry => {
                 let len = thread.read(cx).entries().len();
                 let index = len - 1;
+                let is_user_message = matches!(
+                    thread.read(cx).entries().last(),
+                    Some(AgentThreadEntry::UserMessage(_))
+                );
                 if let Some(active) = self.thread_view(&session_id) {
                     let entry_view_state = active.read(cx).entry_view_state.clone();
                     let list_state = active.read(cx).list_state.clone();
@@ -1699,6 +1705,9 @@ impl ConversationView {
                         );
                     });
                     active.update(cx, |active, cx| {
+                        if is_user_message {
+                            active.user_message_pushed(index);
+                        }
                         active.sync_elicitation_state_for_entry(index, window, cx);
                         active.sync_editor_mode(cx);
                         active.sync_generating_indicator(cx);
@@ -1735,6 +1744,7 @@ impl ConversationView {
                     entry_view_state.update(cx, |view_state, _cx| view_state.remove(range.clone()));
                     list_state.splice(range.clone(), 0);
                     active.update(cx, |active, cx| {
+                        active.entries_removed(range);
                         active.sync_editor_mode(cx);
                         active.sync_presentation(cx);
                     });
@@ -1767,7 +1777,12 @@ impl ConversationView {
                 activity_duration,
                 stop_reason,
             } => {
-                self.sync_thread_presentation(&session_id, cx);
+                if let Some(active) = self.thread_view(&session_id) {
+                    active.update(cx, |active, cx| {
+                        active.finish_turn(stop_reason.as_ref(), *activity_duration, cx);
+                        active.sync_presentation(cx);
+                    });
+                }
                 if thread.read(cx).uses_reported_activity()
                     && let Some(active) = self.thread_view(&session_id)
                 {
@@ -1897,6 +1912,7 @@ impl ConversationView {
                     let is_generating =
                         matches!(thread.read(cx).status(), ThreadStatus::Generating);
                     active.update(cx, |active, cx| {
+                        active.interrupt_turn();
                         if !is_generating {
                             active.thread_retry_status.take();
                             if active.list_state.is_following_tail() {
@@ -9520,11 +9536,17 @@ pub(crate) mod tests {
             let entry_view_state = view.entry_view_state.read(cx);
             let entry_count = view.thread.read(cx).entries().len();
             let headers = (0..entry_count)
-                .filter_map(|entry_ix| {
-                    let thread_collapse::Header::ToolCallGroup {
-                        count, is_expanded, ..
-                    } = entry_view_state.presentation(entry_ix)?.header.as_ref()?;
-                    Some((entry_ix, *count, *is_expanded))
+                .filter_map(|entry_ix| Some((entry_ix, entry_view_state.presentation(entry_ix)?)))
+                .flat_map(|(entry_ix, presentation)| {
+                    presentation
+                        .headers
+                        .iter()
+                        .filter_map(move |header| match header {
+                            thread_collapse::Header::ToolCallGroup {
+                                count, is_expanded, ..
+                            } => Some((entry_ix, *count, *is_expanded)),
+                            thread_collapse::Header::TurnSummary { .. } => None,
+                        })
                 })
                 .collect();
             let hidden = (0..entry_count)
@@ -9810,10 +9832,13 @@ pub(crate) mod tests {
             cx.run_until_parked();
         }
         thread_view.update(cx, |view, cx| {
-            view.toggle_collapse(
+            for key in [
+                thread_collapse::CollapseKey::Turn(0),
+                thread_collapse::CollapseKey::Turn(4),
                 thread_collapse::CollapseKey::ToolCalls(acp_v1::ToolCallId::new("read-3")),
-                cx,
-            );
+            ] {
+                view.toggle_collapse(key, cx);
+            }
         });
         assert_eq!(
             tool_call_group_layout(&thread_view, cx),

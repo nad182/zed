@@ -52,7 +52,10 @@ use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
 use super::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
 };
-use super::thread_collapse::{CollapseKey, Content, Header, tool_call_renders_nothing};
+use super::thread_collapse::{
+    CollapseKey, Content, Header, TurnOutcome, TurnOwner, TurnOwnership, TurnRecord,
+    has_pending_request_elicitation, tool_call_renders_nothing,
+};
 use super::*;
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
@@ -673,6 +676,9 @@ pub struct TurnFields {
     pub turn_started_at: Option<Instant>,
     pub turn_tokens: Option<u64>,
     pub reported_activity_generation: Option<u64>,
+    pub(crate) turn_owner: TurnOwnership,
+    pub(crate) turn_outcome: Option<TurnOutcome>,
+    pub(crate) reported_turn_duration: Option<Duration>,
 }
 
 /// How a tool call is rendered relative to its surroundings.
@@ -1058,6 +1064,7 @@ impl ThreadView {
             thread_search_visible: false,
         };
 
+        this.turn_fields.turn_owner = TurnOwnership::new(this.last_user_message_ix(cx));
         this.sync_reported_activity(cx);
         this.sync_generating_indicator(cx);
         this.sync_editor_mode(cx);
@@ -1407,13 +1414,27 @@ impl ThreadView {
 
     // turns
 
-    pub fn start_turn(&mut self, cx: &mut Context<Self>) -> usize {
+    pub(crate) fn start_turn(&mut self, owner: TurnOwner, cx: &mut Context<Self>) -> usize {
         // A previous response may have settled while the new prompt's contents were loading.
         self.thread_error.take();
-        self.initialize_turn(cx)
+        let generation = self.initialize_turn(cx);
+        self.turn_fields.turn_owner.start(owner);
+        generation
     }
 
     fn initialize_turn(&mut self, cx: &mut Context<Self>) -> usize {
+        if self.turn_fields.turn_owner.has_owner() {
+            self.turn_fields
+                .turn_outcome
+                .get_or_insert(TurnOutcome::Interrupted);
+            let elapsed = self
+                .turn_fields
+                .turn_started_at
+                .map(|started| started.elapsed());
+            self.record_turn(elapsed, cx);
+        }
+        self.turn_fields.turn_outcome = None;
+        self.turn_fields.reported_turn_duration = None;
         self.turn_fields.turn_generation += 1;
         let generation = self.turn_fields.turn_generation;
         self.turn_fields.turn_started_at = Some(Instant::now());
@@ -1431,7 +1452,7 @@ impl ThreadView {
         generation
     }
 
-    pub fn stop_turn(&mut self, generation: usize, _cx: &mut Context<Self>) {
+    pub fn stop_turn(&mut self, generation: usize, cx: &mut Context<Self>) {
         if self.turn_fields.turn_generation != generation {
             return;
         }
@@ -1442,6 +1463,70 @@ impl ThreadView {
             .map(|started| started.elapsed());
         self.turn_fields.last_turn_tokens = self.turn_fields.turn_tokens.take();
         self.turn_fields._turn_timer_task = None;
+        self.record_turn(self.turn_fields.last_turn_duration, cx);
+    }
+
+    pub(crate) fn finish_turn(
+        &mut self,
+        stop_reason: Option<&acp_v2::StopReason>,
+        activity_duration: Option<Duration>,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_turn_outcome(TurnOutcome::from_stop_reason(stop_reason));
+        if self.thread.read(cx).uses_reported_activity() {
+            self.turn_fields.reported_turn_duration = activity_duration;
+        }
+    }
+
+    pub(crate) fn interrupt_turn(&mut self) {
+        self.set_turn_outcome(TurnOutcome::Interrupted);
+    }
+
+    fn set_turn_outcome(&mut self, outcome: TurnOutcome) {
+        if self.turn_fields.turn_outcome != Some(TurnOutcome::Interrupted) {
+            self.turn_fields.turn_outcome = Some(outcome);
+        }
+    }
+
+    fn record_turn(&mut self, elapsed: Option<Duration>, cx: &mut Context<Self>) {
+        let outcome = self
+            .turn_fields
+            .turn_outcome
+            .take()
+            .unwrap_or(TurnOutcome::Unknown);
+        let reported_duration = self.turn_fields.reported_turn_duration.take();
+        let Some(user_message_ix) = self.turn_fields.turn_owner.take() else {
+            return;
+        };
+        if !matches!(
+            self.thread.read(cx).entries().get(user_message_ix),
+            Some(AgentThreadEntry::UserMessage(_))
+        ) {
+            return;
+        }
+        let record = TurnRecord {
+            duration: reported_duration.or(elapsed),
+            outcome,
+        };
+        self.entry_view_state
+            .update(cx, |state, _cx| state.record_turn(user_message_ix, record));
+        self.sync_presentation(cx);
+    }
+
+    pub(crate) fn user_message_pushed(&mut self, entry_ix: usize) {
+        self.turn_fields.turn_owner.user_message_pushed(entry_ix);
+    }
+
+    pub(crate) fn entries_removed(&mut self, range: &Range<usize>) {
+        self.turn_fields.turn_owner.remove(range);
+    }
+
+    fn last_user_message_ix(&self, cx: &App) -> Option<usize> {
+        self.thread
+            .read(cx)
+            .entries()
+            .iter()
+            .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
     }
 
     pub(crate) fn sync_reported_activity(&mut self, cx: &mut Context<Self>) {
@@ -1457,6 +1542,10 @@ impl ThreadView {
         if activity != ForegroundActivity::Idle {
             if self.turn_fields.reported_activity_generation != Some(activity_generation) {
                 self.initialize_turn(cx);
+                let last_user_message_ix = self.last_user_message_ix(cx);
+                self.turn_fields
+                    .turn_owner
+                    .start_reported(last_user_message_ix);
                 self.turn_fields.turn_started_at = started_at;
                 self.turn_fields.reported_activity_generation = Some(activity_generation);
             }
@@ -1464,6 +1553,7 @@ impl ThreadView {
             if self.turn_fields.turn_started_at.is_some() {
                 self.stop_turn(self.turn_fields.turn_generation, cx);
             }
+            self.record_turn(None, cx);
             if self.turn_fields.reported_activity_generation != Some(activity_generation) {
                 self.turn_fields.last_turn_tokens = None;
             }
@@ -1954,7 +2044,12 @@ impl ThreadView {
             let generation = this.update(cx, |this, cx| {
                 this.clear_external_source_prompt_warning(cx);
                 this.thread_error.take();
-                (!uses_reported_activity).then(|| this.start_turn(cx))
+                let owner = if is_native_command {
+                    TurnOwner::None
+                } else {
+                    TurnOwner::NextUserMessage
+                };
+                (!uses_reported_activity).then(|| this.start_turn(owner, cx))
             })?;
 
             this.update_in(cx, |this, _window, cx| {
@@ -2250,6 +2345,7 @@ impl ThreadView {
     }
 
     pub fn cancel_generation(&mut self, cx: &mut Context<Self>) {
+        self.interrupt_turn();
         self.thread_retry_status.take();
         self.thread_error.take();
         self.message_queue.pause();
@@ -6341,9 +6437,10 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
 impl ThreadView {
     pub(crate) fn sync_presentation(&mut self, cx: &mut Context<Self>) {
         let thread = self.thread.clone();
-        let changed = self
-            .entry_view_state
-            .update(cx, |state, cx| state.sync_presentation(&thread, cx));
+        let pending_elicitation = has_pending_request_elicitation(thread.read(cx), cx);
+        let changed = self.entry_view_state.update(cx, |state, cx| {
+            state.sync_presentation(&thread, pending_elicitation, cx)
+        });
         if changed.is_empty() {
             return;
         }
@@ -6361,7 +6458,7 @@ impl ThreadView {
                 let header_ix = (range.start..=scroll_top.item_ix).rev().find(|&entry_ix| {
                     entry_view_state
                         .presentation(entry_ix)
-                        .is_some_and(|presentation| presentation.header.is_some())
+                        .is_some_and(|presentation| !presentation.headers.is_empty())
                 });
                 if let Some(header_ix) = header_ix {
                     self.list_state.scroll_to(ListOffset {
@@ -6390,41 +6487,48 @@ impl ThreadView {
         header: &Header,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let Header::ToolCallGroup {
-            key,
-            count,
-            is_expanded,
-        } = header;
-        let chevron = if *is_expanded {
+        let (key, is_expanded) = match header {
+            Header::TurnSummary {
+                key, is_expanded, ..
+            }
+            | Header::ToolCallGroup {
+                key, is_expanded, ..
+            } => (key.clone(), *is_expanded),
+        };
+        let (element_id, debug_selector) = match &key {
+            CollapseKey::Turn(user_message_ix) => (
+                ElementId::from(("turn-summary", *user_message_ix)),
+                format!("turn-summary-{user_message_ix}"),
+            ),
+            CollapseKey::ToolCalls(_) => (
+                ElementId::from(("tool-call-group", entry_ix)),
+                format!("tool-call-group-{entry_ix}"),
+            ),
+        };
+        let chevron = if is_expanded {
             IconName::ChevronDown
         } else {
             IconName::ChevronRight
         };
-        let key = key.clone();
-        let label = format!("{count} {}", pluralize("tool call", *count));
         h_flex()
             .px_5()
             .py_1p5()
             .child(
-                div()
-                    .debug_selector(move || format!("tool-call-group-{entry_ix}"))
-                    .child(
-                        Button::new(("tool-call-group", entry_ix), label)
-                            .start_icon(
-                                Icon::new(chevron)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                            .label_size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .aria_expanded(*is_expanded)
-                            .tab_index(0_isize)
-                            .on_click(cx.listener(
-                                move |this, _event: &ClickEvent, _window, cx| {
-                                    this.toggle_collapse(key.clone(), cx);
-                                },
-                            )),
-                    ),
+                div().debug_selector(move || debug_selector).child(
+                    Button::new(element_id, header.label())
+                        .start_icon(
+                            Icon::new(chevron)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .label_size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .aria_expanded(is_expanded)
+                        .tab_index(0_isize)
+                        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                            this.toggle_collapse(key.clone(), cx);
+                        })),
+                ),
             )
             .into_any_element()
     }
@@ -6514,12 +6618,24 @@ impl ThreadView {
                 .is_none_or(|entry| !entry.is_indented());
 
         let presentation = self.entry_view_state.read(cx).presentation(entry_ix);
-        let collapse_header = presentation
-            .and_then(|presentation| presentation.header.as_ref())
-            .map(|header| self.render_collapse_header(entry_ix, header, cx));
-        if presentation.is_some_and(|presentation| presentation.content == Content::Hidden) {
-            return collapse_header.unwrap_or_else(|| Empty.into_any());
+        let collapse_headers = presentation
+            .map(|presentation| {
+                presentation
+                    .headers
+                    .iter()
+                    .map(|header| self.render_collapse_header(entry_ix, header, cx))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let content = presentation.map_or(Content::Full, |presentation| presentation.content);
+        if content == Content::Hidden {
+            return if collapse_headers.is_empty() {
+                Empty.into_any()
+            } else {
+                v_flex().w_full().children(collapse_headers).into_any()
+            };
         }
+        let hide_thoughts = content == Content::AnswerWithoutThoughts;
 
         let mut assistant_message_is_blank = false;
 
@@ -6742,6 +6858,7 @@ impl ThreadView {
                                         .into_any_element()
                                 })
                             }
+                            AssistantMessageChunk::Thought { .. } if hide_thoughts => None,
                             AssistantMessageChunk::Thought { block, .. } => {
                                 let this_is_blank = !block.visible_content(cx);
                                 is_blank = is_blank && this_is_blank;
@@ -6807,13 +6924,14 @@ impl ThreadView {
             }
         };
 
-        let primary = match collapse_header {
-            Some(collapse_header) => v_flex()
+        let primary = if collapse_headers.is_empty() {
+            primary
+        } else {
+            v_flex()
                 .w_full()
-                .child(collapse_header)
+                .children(collapse_headers)
                 .child(primary)
-                .into_any_element(),
-            None => primary,
+                .into_any_element()
         };
 
         let is_subagent_output = self.is_subagent()

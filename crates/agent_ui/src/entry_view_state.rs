@@ -24,19 +24,28 @@ use ui::{Context, TextSize};
 use workspace::Workspace;
 
 use crate::conversation_view::thread_collapse::{
-    CollapseKey, Content, EntryPresentation, LayoutInput, entry_kind, layout,
+    CollapseKey, Content, EntryPresentation, LayoutInput, TurnRecord, entry_kind, layout,
 };
 use crate::message_editor::{MessageEditor, MessageEditorEvent, SharedSessionCapabilities};
 
 /// Maps an entry index through the removal of `removed` (a contiguous range of
 /// entries), returning `None` if the index referred to a removed entry.
-fn reindex_after_removal(index: usize, removed: &Range<usize>) -> Option<usize> {
+pub(crate) fn reindex_after_removal(index: usize, removed: &Range<usize>) -> Option<usize> {
     if index < removed.start {
         Some(index)
     } else if index < removed.end {
         None
     } else {
         Some(index - removed.len())
+    }
+}
+
+fn reindex_collapse_key(key: CollapseKey, removed: &Range<usize>) -> Option<CollapseKey> {
+    match key {
+        CollapseKey::Turn(user_message_ix) => {
+            reindex_after_removal(user_message_ix, removed).map(CollapseKey::Turn)
+        }
+        CollapseKey::ToolCalls(_) => Some(key),
     }
 }
 
@@ -75,6 +84,7 @@ pub struct EntryViewState {
     expanded_tool_calls: HashSet<acp_v1::ToolCallId>,
     presentation: Vec<EntryPresentation>,
     expanded: HashSet<CollapseKey>,
+    turn_records: HashMap<usize, TurnRecord>,
 }
 
 impl EntryViewState {
@@ -99,6 +109,7 @@ impl EntryViewState {
             expanded_tool_calls: HashSet::default(),
             presentation: Vec::new(),
             expanded: HashSet::default(),
+            turn_records: HashMap::default(),
         }
     }
 
@@ -112,6 +123,10 @@ impl EntryViewState {
         }
     }
 
+    pub(crate) fn record_turn(&mut self, user_message_ix: usize, record: TurnRecord) {
+        self.turn_records.insert(user_message_ix, record);
+    }
+
     pub(crate) fn presentation(&self, entry_ix: usize) -> Option<&EntryPresentation> {
         self.presentation.get(entry_ix)
     }
@@ -122,12 +137,14 @@ impl EntryViewState {
     }
 
     pub(crate) fn are_thoughts_visible(&self, entry_ix: usize) -> bool {
-        self.is_entry_content_visible(entry_ix)
+        self.presentation(entry_ix)
+            .is_none_or(|presentation| presentation.content == Content::Full)
     }
 
     pub(crate) fn sync_presentation(
         &mut self,
         thread: &Entity<AcpThread>,
+        pending_elicitation: bool,
         cx: &mut Context<Self>,
     ) -> Vec<Range<usize>> {
         let collapse_enabled = AgentSettings::get_global(cx).collapse_finished_turns;
@@ -135,7 +152,7 @@ impl EntryViewState {
             return Vec::new();
         }
         let presentation = if collapse_enabled {
-            self.layout(thread.read(cx), cx)
+            self.layout(thread.read(cx), pending_elicitation, cx)
         } else {
             Vec::new()
         };
@@ -566,7 +583,12 @@ impl EntryViewState {
         }
     }
 
-    fn layout(&self, thread: &AcpThread, cx: &App) -> Vec<EntryPresentation> {
+    fn layout(
+        &self,
+        thread: &AcpThread,
+        pending_elicitation: bool,
+        cx: &App,
+    ) -> Vec<EntryPresentation> {
         let entries = thread.entries();
         let kinds = entries
             .iter()
@@ -579,10 +601,13 @@ impl EntryViewState {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        let is_generating = matches!(thread.status(), ThreadStatus::Generating);
         layout(LayoutInput {
             kinds: &kinds,
             tool_call_ids: &tool_call_ids,
-            tail_is_growing: matches!(thread.status(), ThreadStatus::Generating),
+            tail_is_growing: is_generating,
+            last_turn_is_live: is_generating || pending_elicitation,
+            turn_records: &self.turn_records,
             expanded: &self.expanded,
         })
     }
@@ -592,6 +617,18 @@ impl EntryViewState {
         let presentation_len = self.presentation.len();
         self.presentation
             .drain(range.start.min(presentation_len)..range.end.min(presentation_len));
+        self.expanded = self
+            .expanded
+            .drain()
+            .filter_map(|key| reindex_collapse_key(key, &range))
+            .collect();
+        self.turn_records = self
+            .turn_records
+            .drain()
+            .filter_map(|(user_message_ix, record)| {
+                reindex_after_removal(user_message_ix, &range).map(|ix| (ix, record))
+            })
+            .collect();
 
         self.expanded_compactions = self
             .expanded_compactions
@@ -944,6 +981,28 @@ mod tests {
         assert_eq!(reindex_after_removal(5, &(2..4)), Some(3));
         // An empty removal range leaves indices untouched.
         assert_eq!(reindex_after_removal(3, &(2..2)), Some(3));
+    }
+
+    #[test]
+    fn test_reindex_collapse_key() {
+        use super::reindex_collapse_key;
+        use crate::conversation_view::thread_collapse::CollapseKey;
+        use agent_client_protocol::schema::v1 as acp_v1;
+
+        assert_eq!(
+            reindex_collapse_key(CollapseKey::Turn(1), &(2..4)),
+            Some(CollapseKey::Turn(1))
+        );
+        assert_eq!(reindex_collapse_key(CollapseKey::Turn(2), &(2..4)), None);
+        assert_eq!(
+            reindex_collapse_key(CollapseKey::Turn(6), &(2..4)),
+            Some(CollapseKey::Turn(4))
+        );
+        let tool_calls = CollapseKey::ToolCalls(acp_v1::ToolCallId::new("read"));
+        assert_eq!(
+            reindex_collapse_key(tool_calls.clone(), &(0..10)),
+            Some(tool_calls)
+        );
     }
 
     #[gpui::test]
