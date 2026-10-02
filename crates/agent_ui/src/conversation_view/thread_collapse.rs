@@ -50,6 +50,12 @@ pub(crate) struct EntryPresentation {
     pub content: Content,
 }
 
+impl EntryPresentation {
+    pub(crate) fn is_full(&self) -> bool {
+        self.header.is_none() && self.content == Content::Full
+    }
+}
+
 pub(crate) struct LayoutInput<'a> {
     pub kinds: &'a [EntryKind],
     pub tool_call_ids: &'a [Option<acp_v1::ToolCallId>],

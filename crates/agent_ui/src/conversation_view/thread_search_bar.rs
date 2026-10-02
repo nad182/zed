@@ -344,6 +344,9 @@ impl ThreadSearchBar {
         let thread = self.thread.read(cx);
         let entry_view_state = self.entry_view_state.read(cx);
         for (entry_ix, entry) in thread.entries().iter().enumerate() {
+            if !entry_view_state.is_entry_content_visible(entry_ix) {
+                continue;
+            }
             match entry {
                 // Past user messages render through `MessageEditor`, not markdown.
                 AgentThreadEntry::UserMessage(_) => {
@@ -958,9 +961,10 @@ fn collect_markdowns(
                         out.extend(block.markdowns().cloned());
                     }
                     AssistantMessageChunk::Thought { block, .. }
-                        if entry_view_state
-                            .thinking_block_state((entry_ix, chunk_ix), cx)
-                            .0 =>
+                        if entry_view_state.are_thoughts_visible(entry_ix)
+                            && entry_view_state
+                                .thinking_block_state((entry_ix, chunk_ix), cx)
+                                .0 =>
                     {
                         out.extend(block.markdowns().cloned());
                     }

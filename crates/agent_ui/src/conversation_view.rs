@@ -865,6 +865,7 @@ impl ConversationView {
         let mut subscriptions = vec![
             cx.observe_global_in::<SettingsStore>(window, Self::agent_ui_font_size_changed),
             cx.observe_global_in::<SettingsStore>(window, Self::invalidate_mermaid_caches),
+            cx.observe_global_in::<SettingsStore>(window, Self::sync_thread_presentations),
             cx.observe_global_in::<AgentUiFontSize>(window, Self::agent_ui_font_size_changed),
             cx.observe_global_in::<AgentBufferFontSize>(window, Self::agent_ui_font_size_changed),
             cx.subscribe_in(
@@ -1338,6 +1339,7 @@ impl ConversationView {
             for ix in 0..count {
                 view_state.sync_entry(ix, &thread, window, cx);
             }
+            view_state.sync_presentation(thread.read(cx), cx);
             list_state.splice_focusable(
                 0..0,
                 (0..count).map(|ix| view_state.entry(ix)?.focus_handle(cx)),
@@ -1666,6 +1668,7 @@ impl ConversationView {
                     active.update(cx, |active, cx| {
                         active.sync_reported_activity(cx);
                         active.sync_generating_indicator(cx);
+                        active.sync_presentation(cx);
                     });
                 }
             }
@@ -1699,6 +1702,7 @@ impl ConversationView {
                         active.sync_elicitation_state_for_entry(index, window, cx);
                         active.sync_editor_mode(cx);
                         active.sync_generating_indicator(cx);
+                        active.sync_presentation(cx);
                     });
                 }
             }
@@ -1720,6 +1724,7 @@ impl ConversationView {
                         active.sync_elicitation_state_for_entry(*index, window, cx);
                         active.auto_expand_streaming_thought(cx);
                         active.sync_generating_indicator(cx);
+                        active.sync_presentation(cx);
                     });
                 }
             }
@@ -1731,6 +1736,7 @@ impl ConversationView {
                     list_state.splice(range.clone(), 0);
                     active.update(cx, |active, cx| {
                         active.sync_editor_mode(cx);
+                        active.sync_presentation(cx);
                     });
                 }
             }
@@ -1738,13 +1744,17 @@ impl ConversationView {
                 self.load_subagent_session(subagent_session_id.clone(), session_id, window, cx)
             }
             AcpThreadEvent::ToolAuthorizationRequested(_) => {
+                self.sync_thread_presentation(&session_id, cx);
                 self.notify_with_sound("Waiting for tool confirmation", IconName::Info, window, cx);
             }
-            AcpThreadEvent::ToolAuthorizationReceived(_) => {}
             AcpThreadEvent::ElicitationRequested(_) => {
+                self.sync_thread_presentation(&session_id, cx);
                 self.notify_with_sound("Waiting for input", IconName::Info, window, cx);
             }
-            AcpThreadEvent::ElicitationResponded(_) => {}
+            AcpThreadEvent::ToolAuthorizationReceived(_)
+            | AcpThreadEvent::ElicitationResponded(_) => {
+                self.sync_thread_presentation(&session_id, cx);
+            }
             AcpThreadEvent::Retry(retry) => {
                 if let Some(active) = self.thread_view(&session_id) {
                     active.update(cx, |active, _cx| {
@@ -1757,6 +1767,7 @@ impl ConversationView {
                 activity_duration,
                 stop_reason,
             } => {
+                self.sync_thread_presentation(&session_id, cx);
                 if thread.read(cx).uses_reported_activity()
                     && let Some(active) = self.thread_view(&session_id)
                 {
@@ -3283,6 +3294,21 @@ impl ConversationView {
             entry_view_state.update(cx, |entry_view_state, cx| {
                 entry_view_state.agent_ui_font_size_changed(cx);
             });
+        }
+    }
+
+    fn sync_thread_presentation(&self, session_id: &acp_v1::SessionId, cx: &mut Context<Self>) {
+        if let Some(thread_view) = self.thread_view(session_id) {
+            thread_view.update(cx, |thread_view, cx| thread_view.sync_presentation(cx));
+        }
+    }
+
+    fn sync_thread_presentations(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(connected) = self.as_connected() else {
+            return;
+        };
+        for thread_view in connected.threads.values().cloned().collect::<Vec<_>>() {
+            thread_view.update(cx, |thread_view, cx| thread_view.sync_presentation(cx));
         }
     }
 
@@ -9455,6 +9481,114 @@ pub(crate) mod tests {
                 Some(original_editor),
             );
         });
+    }
+
+    fn set_collapse_finished_turns(enabled: bool, cx: &mut App) {
+        AgentSettings::override_global(
+            AgentSettings {
+                collapse_finished_turns: enabled,
+                ..AgentSettings::get_global(cx).clone()
+            },
+            cx,
+        );
+    }
+
+    fn finished_read(tool_call_id: &str) -> serde_json::Value {
+        json!({"toolCallId": tool_call_id, "title": "Read file", "kind": "read", "status": "completed"})
+    }
+
+    fn apply_tool_call_updates(
+        thread: &Entity<AcpThread>,
+        updates: impl IntoIterator<Item = serde_json::Value>,
+        cx: &mut VisualTestContext,
+    ) {
+        for update in updates {
+            let update: agent_client_protocol::schema::v2::ToolCallUpdate =
+                serde_json::from_value(update).expect("tool call should deserialize");
+            thread
+                .update(cx, |thread, cx| thread.upsert_tool_call_patch(update, cx))
+                .expect("tool call should apply");
+        }
+        cx.run_until_parked();
+    }
+
+    fn tool_call_group_layout(
+        thread_view: &Entity<ThreadView>,
+        cx: &mut VisualTestContext,
+    ) -> (Vec<(usize, usize, bool)>, Vec<usize>) {
+        thread_view.read_with(cx, |view, cx| {
+            let entry_view_state = view.entry_view_state.read(cx);
+            let entry_count = view.thread.read(cx).entries().len();
+            let headers = (0..entry_count)
+                .filter_map(|entry_ix| {
+                    let thread_collapse::Header::ToolCallGroup {
+                        count, is_expanded, ..
+                    } = entry_view_state.presentation(entry_ix)?.header.as_ref()?;
+                    Some((entry_ix, *count, *is_expanded))
+                })
+                .collect();
+            let hidden = (0..entry_count)
+                .filter(|&entry_ix| !entry_view_state.is_entry_content_visible(entry_ix))
+                .collect();
+            (headers, hidden)
+        })
+    }
+
+    #[gpui::test]
+    async fn test_finished_tool_calls_are_grouped_around_diffs(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+
+        apply_tool_call_updates(
+            &thread,
+            [
+                finished_read("read-1"),
+                finished_read("read-2"),
+                finished_read("read-3"),
+                json!({
+                    "toolCallId": "edit",
+                    "title": "Edit file",
+                    "kind": "edit",
+                    "status": "completed",
+                    "content": [{
+                        "type": "diff",
+                        "changes": [{"operation": "modify", "path": "/tmp/grouped"}],
+                        "patch": {
+                            "format": "git_patch",
+                            "text": "diff --git a//tmp/grouped b//tmp/grouped\n--- a//tmp/grouped\n+++ b//tmp/grouped\n@@ -1 +1 @@\n-old\n+new\n"
+                        }
+                    }]
+                }),
+                finished_read("read-4"),
+                json!({"toolCallId": "running", "title": "Read file", "kind": "read", "status": "in_progress"}),
+                finished_read("read-5"),
+            ],
+            cx,
+        );
+        assert_eq!(
+            tool_call_group_layout(&thread_view, cx),
+            (vec![(0, 3, false)], vec![0, 1, 2])
+        );
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.toggle_collapse(
+                thread_collapse::CollapseKey::ToolCalls(acp_v1::ToolCallId::new("read-1")),
+                window,
+                cx,
+            );
+        });
+        assert_eq!(
+            tool_call_group_layout(&thread_view, cx),
+            (vec![(0, 3, true)], vec![])
+        );
+
+        cx.update(|_, cx| set_collapse_finished_turns(false, cx));
+        cx.run_until_parked();
+        assert_eq!(tool_call_group_layout(&thread_view, cx), (vec![], vec![]));
     }
 
     #[gpui::test]

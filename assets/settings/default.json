@@ -1368,6 +1368,12 @@
     //
     // Default: true
     "expand_terminal_card": true,
+    // Whether to collapse runs of consecutive finished tool calls in the agent panel
+    // into a single expandable row. Tool calls that show a diff, subagents and calls
+    // awaiting approval stay visible.
+    //
+    // Default: false
+    "collapse_finished_turns": false,
     // Command to automatically run when Zed creates a Terminal Thread shell in the agent panel.
     // The command is sent to the shell as if typed, so it is interpreted by your
     // configured shell (including on Windows and remote/WSL projects).
