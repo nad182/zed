@@ -63,7 +63,7 @@ impl Header {
 
 fn turn_summary_label(steps: usize, duration: Option<Duration>) -> String {
     match duration {
-        Some(duration) if duration >= STOPWATCH_THRESHOLD => {
+        Some(duration) if duration > STOPWATCH_THRESHOLD => {
             format!("Worked for {}", duration_alt_display(duration))
         }
         _ if steps > 0 => format!("Worked · {steps} {}", pluralize("step", steps)),
@@ -102,7 +102,6 @@ pub(crate) struct LayoutInput<'a> {
 
 pub(crate) fn layout(input: LayoutInput) -> Vec<EntryPresentation> {
     let mut presentation = vec![EntryPresentation::default(); input.kinds.len()];
-    let mut collapsed_work = Vec::new();
     for turn in collapsible_turns(input.kinds, input.last_turn_is_live) {
         let record = input.turn_records.get(&turn.user_message_ix);
         if record.is_some_and(|record| record.outcome == TurnOutcome::Interrupted) {
@@ -123,15 +122,11 @@ pub(crate) fn layout(input: LayoutInput) -> Vec<EntryPresentation> {
                 entry.content = Content::Hidden;
             }
             presentation[turn.final_answer_ix].content = Content::AnswerWithoutThoughts;
-            collapsed_work.push(turn.work);
         }
     }
 
     for run in tool_call_runs(input.kinds, input.tail_is_growing) {
-        if collapsed_work
-            .iter()
-            .any(|work| work.contains(&run.entries.start))
-        {
+        if presentation[run.entries.start].content == Content::Hidden {
             continue;
         }
         let Some(Some(first_tool_call_id)) = input.tool_call_ids.get(run.entries.start) else {
@@ -692,6 +687,37 @@ mod tests {
     }
 
     #[test]
+    fn runs_next_to_a_collapsed_turn_keep_their_groups() {
+        let kinds = [
+            UserMessage,
+            TOOL,
+            TOOL,
+            UserMessage,
+            TOOL,
+            TOOL,
+            TEXT,
+            UserMessage,
+            TOOL,
+            TOOL,
+        ];
+        assert_eq!(
+            Scenario::new(&kinds).layout(),
+            vec![
+                full(),
+                group(1, 2, false),
+                hidden(),
+                full(),
+                with_headers(Content::Hidden, vec![turn_header(3, 2, false)]),
+                hidden(),
+                answer_without_thoughts(),
+                full(),
+                group(8, 2, false),
+                hidden(),
+            ]
+        );
+    }
+
+    #[test]
     fn interrupted_turns_never_collapse() {
         let kinds = [UserMessage, THOUGHT, TOOL, TEXT];
         let scenario = Scenario::new(&kinds).record(0, TurnOutcome::Interrupted);
@@ -808,7 +834,12 @@ mod tests {
         );
         assert_eq!(
             turn_summary_label(3, Some(STOPWATCH_THRESHOLD)),
-            format!("Worked for {}", duration_alt_display(STOPWATCH_THRESHOLD))
+            "Worked · 3 steps"
+        );
+        let just_over_threshold = STOPWATCH_THRESHOLD + Duration::from_secs(1);
+        assert_eq!(
+            turn_summary_label(3, Some(just_over_threshold)),
+            format!("Worked for {}", duration_alt_display(just_over_threshold))
         );
         assert_eq!(
             turn_summary_label(3, Some(Duration::from_secs(4))),
