@@ -645,7 +645,7 @@ impl EntryViewState {
 
 impl EventEmitter<EntryViewEvent> for EntryViewState {}
 
-pub struct PresentationChanged;
+pub(crate) struct PresentationChanged;
 
 impl EventEmitter<PresentationChanged> for EntryViewState {}
 
