@@ -52,6 +52,7 @@ use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
 use super::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
 };
+use super::thread_collapse::tool_call_renders_nothing;
 use super::*;
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
@@ -6338,6 +6339,41 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
 }
 
 impl ThreadView {
+    fn render_standalone_tool_call(
+        &self,
+        entry_ix: usize,
+        tool_call: &ToolCall,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        if tool_call_renders_nothing(tool_call, cx) {
+            return None;
+        }
+
+        let tool_call = self.render_any_tool_call(
+            self.thread.read(cx).session_id(),
+            entry_ix,
+            tool_call,
+            &self.focus_handle(cx),
+            ToolCallLayout::Standalone,
+            window,
+            cx,
+        );
+
+        Some(
+            if let Some(handle) = self
+                .entry_view_state
+                .read(cx)
+                .entry(entry_ix)
+                .and_then(|entry| entry.focus_handle(cx))
+            {
+                tool_call.track_focus(&handle).into_any()
+            } else {
+                tool_call.into_any()
+            },
+        )
+    }
+
     fn render_entries(&mut self, cx: &mut Context<Self>) -> List {
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let centered_container = move |content: AnyElement| {
@@ -6644,55 +6680,9 @@ impl ThreadView {
                         .into_any()
                 }
             }
-            AgentThreadEntry::ToolCall(tool_call) => {
-                // A canceled tool call that produced visible output is still worth
-                // showing, but one that was canceled before producing anything just
-                // renders as a useless "Canceled" card — hide those entirely.
-                if matches!(tool_call.status(), ToolCallStatus::Canceled) {
-                    let has_visible_content =
-                        tool_call.content().iter().any(|content| match content {
-                            ToolCallContent::ContentBlock { block, .. } => {
-                                block.visible_content(cx)
-                            }
-                            ToolCallContent::Diff(_)
-                            | ToolCallContent::LegacyDiff { .. }
-                            | ToolCallContent::Terminal { .. } => true,
-                            ToolCallContent::DiffPatch { render, .. } => {
-                                !render.files.is_empty()
-                                    || render.fallback.as_ref().is_some_and(|markdown| {
-                                        !markdown.read(cx).source().is_empty()
-                                    })
-                            }
-                            ToolCallContent::Other { markdown, .. } => {
-                                !markdown.read(cx).source().is_empty()
-                            }
-                        });
-                    if !has_visible_content {
-                        return Empty.into_any();
-                    }
-                }
-
-                let tool_call = self.render_any_tool_call(
-                    self.thread.read(cx).session_id(),
-                    entry_ix,
-                    tool_call,
-                    &self.focus_handle(cx),
-                    ToolCallLayout::Standalone,
-                    window,
-                    cx,
-                );
-
-                if let Some(handle) = self
-                    .entry_view_state
-                    .read(cx)
-                    .entry(entry_ix)
-                    .and_then(|entry| entry.focus_handle(cx))
-                {
-                    tool_call.track_focus(&handle).into_any()
-                } else {
-                    tool_call.into_any()
-                }
-            }
+            AgentThreadEntry::ToolCall(tool_call) => self
+                .render_standalone_tool_call(entry_ix, tool_call, window, cx)
+                .unwrap_or_else(|| Empty.into_any()),
             AgentThreadEntry::Elicitation(elicitation_id) => {
                 let thread = self.thread.read(cx);
                 if let Some((_, elicitation)) = thread.elicitation(elicitation_id)
@@ -8467,12 +8457,7 @@ impl ThreadView {
             matches!(tool_call.status(), ToolCallStatus::WaitingForConfirmation);
         let is_terminal_tool = matches!(tool_call.kind(), acp_v2::ToolKind::Execute);
 
-        let is_edit = matches!(tool_call.kind(), acp_v2::ToolKind::Edit)
-            || tool_call.diffs().next().is_some()
-            || tool_call
-                .content()
-                .iter()
-                .any(|content| matches!(content, ToolCallContent::DiffPatch { .. }));
+        let is_edit = tool_call.shows_diff();
 
         let is_cancelled_edit = is_edit && matches!(tool_call.status(), ToolCallStatus::Canceled);
         let (has_revealed_diff, tool_call_output_focus, tool_call_output_focus_handle) = tool_call
