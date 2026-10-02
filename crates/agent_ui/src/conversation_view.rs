@@ -866,7 +866,9 @@ impl ConversationView {
         let mut subscriptions = vec![
             cx.observe_global_in::<SettingsStore>(window, Self::agent_ui_font_size_changed),
             cx.observe_global_in::<SettingsStore>(window, Self::invalidate_mermaid_caches),
-            cx.observe_global_in::<SettingsStore>(window, Self::sync_thread_presentations),
+            cx.observe_global_in::<SettingsStore>(window, |this, _window, cx| {
+                this.sync_thread_presentations(cx)
+            }),
             cx.observe_global_in::<AgentUiFontSize>(window, Self::agent_ui_font_size_changed),
             cx.observe_global_in::<AgentBufferFontSize>(window, Self::agent_ui_font_size_changed),
             cx.subscribe_in(
@@ -976,6 +978,7 @@ impl ConversationView {
     ) -> Option<Subscription> {
         let store = connection.request_elicitations()?;
         Some(cx.observe(&store, |this, _store, cx| {
+            this.sync_thread_presentations(cx);
             if let Some(active_thread) = this.active_thread().cloned() {
                 active_thread.update(cx, |_thread, cx| cx.notify());
             }
@@ -3317,7 +3320,7 @@ impl ConversationView {
         }
     }
 
-    fn sync_thread_presentations(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn sync_thread_presentations(&self, cx: &mut Context<Self>) {
         let Some(connected) = self.as_connected() else {
             return;
         };
@@ -7641,6 +7644,16 @@ pub(crate) mod tests {
         }
     }
 
+    fn request_scoped_name_elicitation(request_id: i64) -> acp_v1::CreateElicitationRequest {
+        acp_v1::CreateElicitationRequest::new(
+            acp_v1::ElicitationFormMode::new(
+                acp_v1::ElicitationRequestScope::new(acp_v1::RequestId::Number(request_id)),
+                acp_v1::ElicitationSchema::new().string("name", true),
+            ),
+            "Provide a name",
+        )
+    }
+
     struct ReleaseRequestElicitationConnection {
         store: Entity<ElicitationStore>,
         response: Arc<Mutex<Option<acp_v1::ElicitationAction>>>,
@@ -7670,16 +7683,7 @@ pub(crate) mod tests {
             );
             let response_task = self.store.update(cx, |store, cx| {
                 store
-                    .request_elicitation(
-                        acp_v1::CreateElicitationRequest::new(
-                            acp_v1::ElicitationFormMode::new(
-                                acp_v1::ElicitationRequestScope::new(acp_v1::RequestId::Number(1)),
-                                acp_v1::ElicitationSchema::new().string("name", true),
-                            ),
-                            "Provide a name",
-                        ),
-                        cx,
-                    )
+                    .request_elicitation(request_scoped_name_elicitation(1), cx)
                     .expect("request-scoped elicitation should be accepted")
             });
             let response = self.response.clone();
@@ -10270,6 +10274,59 @@ pub(crate) mod tests {
             Some(turn_ownership::TurnOutcome::Finished)
         );
         assert_eq!(turn_summaries(&thread_view, cx).len(), 1);
+    }
+
+    #[gpui::test]
+    async fn test_request_elicitations_recompute_turn_presentation(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            set_collapse_finished_turns(true, cx);
+            cx.update_flags(true, vec![AcpBetaFeatureFlag::NAME.to_string()]);
+        });
+        let server = ReleaseRequestElicitationServer {
+            response: Arc::new(Mutex::new(None)),
+        };
+        let (conversation_view, cx) = setup_conversation_view(server, cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let store = conversation_view
+            .read_with(cx, |view, _| view.request_elicitation_connection())
+            .expect("connection")
+            .request_elicitations()
+            .expect("request elicitation store");
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Prompt", cx))
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+        for update in [
+            finished_read_update("read-1", "Read file"),
+            message_update("Done."),
+        ] {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .handle_session_update(update, cx)
+                    .expect("session update");
+            });
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            turn_summaries(&thread_view, cx),
+            vec![],
+            "a pending question keeps the turn open"
+        );
+
+        store.update(cx, |store, cx| store.clear(cx));
+        cx.run_until_parked();
+        assert_eq!(turn_summaries(&thread_view, cx).len(), 1);
+
+        let _pending_response = store.update(cx, |store, cx| {
+            store
+                .request_elicitation(request_scoped_name_elicitation(2), cx)
+                .expect("request-scoped elicitation should be accepted")
+        });
+        cx.run_until_parked();
+        assert_eq!(turn_summaries(&thread_view, cx), vec![]);
     }
 
     #[gpui::test]
