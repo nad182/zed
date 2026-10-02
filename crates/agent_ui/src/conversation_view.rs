@@ -9631,6 +9631,132 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_thread_search_skips_collapsed_tool_call_groups(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        apply_tool_call_updates(
+            &thread,
+            [
+                finished_read("read-1"),
+                json!({"toolCallId": "read-2", "title": "Read papaya", "kind": "read", "status": "completed"}),
+            ],
+            cx,
+        );
+        assert_eq!(
+            tool_call_group_layout(&thread_view, cx),
+            (vec![(0, 2, false)], vec![0, 1])
+        );
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.toggle_search(&crate::ToggleSearch, window, cx);
+        });
+        let search_bar = thread_view
+            .read_with(cx, |view, _| view.thread_search_bar.clone())
+            .expect("search should be open");
+        let papaya_matches = |cx: &mut VisualTestContext| {
+            search_bar.update_in(cx, |bar, window, cx| {
+                bar.query_editor.update(cx, |editor, cx| {
+                    editor.set_text("papaya", window, cx);
+                });
+                bar.update_matches(window, cx);
+            });
+            cx.run_until_parked();
+            search_bar.read_with(cx, |bar, _| bar.match_count())
+        };
+        assert_eq!(papaya_matches(cx), 0);
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.toggle_collapse(
+                thread_collapse::CollapseKey::ToolCalls(acp_v1::ToolCallId::new("read-1")),
+                window,
+                cx,
+            );
+        });
+        assert_eq!(papaya_matches(cx), 1);
+    }
+
+    #[gpui::test]
+    async fn test_removing_entries_drops_their_tool_call_group_presentation(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let finished_read = |tool_call_id: &str| {
+            acp_v1::SessionUpdate::ToolCall(
+                acp_v1::ToolCall::new(tool_call_id.to_string(), "Read file")
+                    .kind(acp_v1::ToolKind::Read)
+                    .status(acp_v1::ToolCallStatus::Completed),
+            )
+        };
+
+        for (prompt, first_read, second_read) in [
+            ("First prompt", "read-1", "read-2"),
+            ("Second prompt", "read-3", "read-4"),
+        ] {
+            connection.set_next_prompt_updates(vec![
+                finished_read(first_read),
+                finished_read(second_read),
+                acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new("Done.".into())),
+            ]);
+            thread
+                .update(cx, |thread, cx| thread.send_raw(prompt, cx))
+                .await
+                .expect("prompt should succeed");
+            cx.run_until_parked();
+        }
+        thread_view.update_in(cx, |view, window, cx| {
+            view.toggle_collapse(
+                thread_collapse::CollapseKey::ToolCalls(acp_v1::ToolCallId::new("read-3")),
+                window,
+                cx,
+            );
+        });
+        assert_eq!(
+            tool_call_group_layout(&thread_view, cx),
+            (vec![(1, 2, false), (5, 2, true)], vec![1, 2])
+        );
+
+        let second_prompt_id = thread.read_with(cx, |thread, _| {
+            let Some(AgentThreadEntry::UserMessage(message)) = thread.entries().get(4) else {
+                panic!("expected the second prompt at entry 4");
+            };
+            message
+                .client_id
+                .clone()
+                .expect("prompt should have a client id")
+        });
+        thread
+            .update(cx, |thread, cx| thread.rewind(second_prompt_id, cx))
+            .await
+            .expect("rewind should succeed");
+        cx.run_until_parked();
+
+        assert_eq!(
+            tool_call_group_layout(&thread_view, cx),
+            (vec![(1, 2, false)], vec![1, 2])
+        );
+        thread_view.read_with(cx, |view, cx| {
+            let entry_count = view.thread.read(cx).entries().len();
+            assert_eq!(entry_count, 4);
+            assert!(
+                view.entry_view_state
+                    .read(cx)
+                    .presentation(entry_count)
+                    .is_none()
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_awaiting_authorization_searches_visible_patch_content(cx: &mut TestAppContext) {
         use agent_client_protocol::schema::v2 as acp_v2;
 
