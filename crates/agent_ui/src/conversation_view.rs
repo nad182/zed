@@ -9592,6 +9592,45 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_tool_call_group_header_toggles_on_click_and_keyboard(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        apply_tool_call_updates(
+            &thread,
+            [finished_read("read-1"), finished_read("read-2")],
+            cx,
+        );
+        let collapsed = (vec![(0, 2, false)], vec![0, 1]);
+        let expanded = (vec![(0, 2, true)], vec![]);
+        assert_eq!(tool_call_group_layout(&thread_view, cx), collapsed);
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.focus_handle(cx).focus(window, cx);
+            window.focus_next(cx);
+        });
+        for (key, expected) in [("enter", &expanded), ("space", &collapsed)] {
+            cx.simulate_keystrokes(key);
+            cx.simulate_event(gpui::KeyUpEvent {
+                keystroke: gpui::Keystroke::parse(key).expect("valid keystroke"),
+            });
+            cx.run_until_parked();
+            assert_eq!(&tool_call_group_layout(&thread_view, cx), expected, "{key}");
+        }
+
+        let header = cx
+            .debug_bounds("tool-call-group-0")
+            .expect("group header should render");
+        cx.simulate_click(header.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(tool_call_group_layout(&thread_view, cx), expanded);
+    }
+
+    #[gpui::test]
     async fn test_awaiting_authorization_searches_visible_patch_content(cx: &mut TestAppContext) {
         use agent_client_protocol::schema::v2 as acp_v2;
 

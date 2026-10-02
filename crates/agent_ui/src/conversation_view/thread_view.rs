@@ -6408,26 +6408,28 @@ impl ThreadView {
             IconName::ChevronRight
         };
         let key = key.clone();
-        div()
+        let label = format!("{count} {}", pluralize("tool call", *count));
+        h_flex()
             .px_5()
-            .py_0p5()
+            .py_1p5()
             .child(
-                Button::new(
-                    ("tool-call-group", entry_ix),
-                    format!("{count} {}", pluralize("tool call", *count)),
-                )
-                .start_icon(
-                    Icon::new(chevron)
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .label_size(LabelSize::Small)
-                .color(Color::Muted)
-                .on_click(cx.listener(
-                    move |this, _event: &ClickEvent, window, cx| {
-                        this.toggle_collapse(key.clone(), window, cx);
-                    },
-                )),
+                div()
+                    .debug_selector(move || format!("tool-call-group-{entry_ix}"))
+                    .child(
+                        Button::new(("tool-call-group", entry_ix), label)
+                            .start_icon(
+                                Icon::new(chevron)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .label_size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .aria_expanded(*is_expanded)
+                            .tab_index(0_isize)
+                            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                                this.toggle_collapse(key.clone(), window, cx);
+                            })),
+                    ),
             )
             .into_any_element()
     }
