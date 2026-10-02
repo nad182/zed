@@ -1339,7 +1339,7 @@ impl ConversationView {
             for ix in 0..count {
                 view_state.sync_entry(ix, &thread, window, cx);
             }
-            view_state.sync_presentation(thread.read(cx), cx);
+            view_state.sync_presentation(&thread, cx);
             list_state.splice_focusable(
                 0..0,
                 (0..count).map(|ix| view_state.entry(ix)?.focus_handle(cx)),
@@ -9574,10 +9574,9 @@ pub(crate) mod tests {
             (vec![(0, 3, false)], vec![0, 1, 2])
         );
 
-        thread_view.update_in(cx, |view, window, cx| {
+        thread_view.update(cx, |view, cx| {
             view.toggle_collapse(
                 thread_collapse::CollapseKey::ToolCalls(acp_v1::ToolCallId::new("read-1")),
-                window,
                 cx,
             );
         });
@@ -9669,14 +9668,111 @@ pub(crate) mod tests {
         };
         assert_eq!(papaya_matches(cx), 0);
 
-        thread_view.update_in(cx, |view, window, cx| {
+        thread_view.update(cx, |view, cx| {
             view.toggle_collapse(
                 thread_collapse::CollapseKey::ToolCalls(acp_v1::ToolCallId::new("read-1")),
-                window,
                 cx,
             );
         });
         assert_eq!(papaya_matches(cx), 1);
+    }
+
+    fn papaya_read(tool_call_id: &str) -> serde_json::Value {
+        json!({"toolCallId": tool_call_id, "title": "Read papaya", "kind": "read", "status": "completed"})
+    }
+
+    fn search_thread(
+        thread_view: &Entity<ThreadView>,
+        query: &str,
+        cx: &mut VisualTestContext,
+    ) -> Entity<super::thread_search_bar::ThreadSearchBar> {
+        thread_view.update_in(cx, |view, window, cx| {
+            view.toggle_search(&crate::ToggleSearch, window, cx);
+        });
+        let search_bar = thread_view
+            .read_with(cx, |view, _| view.thread_search_bar.clone())
+            .expect("search should be open");
+        search_bar.update_in(cx, |bar, window, cx| {
+            bar.query_editor.update(cx, |editor, cx| {
+                editor.set_text(query, window, cx);
+            });
+            bar.update_matches(window, cx);
+        });
+        cx.run_until_parked();
+        search_bar
+    }
+
+    fn settled_match_count(
+        search_bar: &Entity<super::thread_search_bar::ThreadSearchBar>,
+        cx: &mut VisualTestContext,
+    ) -> usize {
+        cx.executor()
+            .advance_clock(super::thread_search_bar::SEARCH_UPDATE_DEBOUNCE * 2);
+        cx.run_until_parked();
+        search_bar.read_with(cx, |bar, _| bar.match_count())
+    }
+
+    async fn assert_search_follows_collapse_setting(
+        initially_collapsed: bool,
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(initially_collapsed, cx));
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        apply_tool_call_updates(
+            &thread,
+            [finished_read("read-1"), papaya_read("read-2")],
+            cx,
+        );
+        let visible_matches = |collapsed: bool| if collapsed { 0 } else { 1 };
+
+        let search_bar = search_thread(&thread_view, "papaya", cx);
+        assert_eq!(
+            settled_match_count(&search_bar, cx),
+            visible_matches(initially_collapsed)
+        );
+
+        cx.update(|_, cx| set_collapse_finished_turns(!initially_collapsed, cx));
+        assert_eq!(
+            settled_match_count(&search_bar, cx),
+            visible_matches(!initially_collapsed)
+        );
+    }
+
+    #[gpui::test]
+    async fn test_thread_search_drops_matches_hidden_by_enabling_collapse(cx: &mut TestAppContext) {
+        assert_search_follows_collapse_setting(false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn test_thread_search_finds_matches_revealed_by_disabling_collapse(
+        cx: &mut TestAppContext,
+    ) {
+        assert_search_follows_collapse_setting(true, cx).await;
+    }
+
+    #[gpui::test]
+    async fn test_thread_search_refreshes_when_a_tool_call_group_forms(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        apply_tool_call_updates(&thread, [papaya_read("read-1")], cx);
+
+        let search_bar = search_thread(&thread_view, "papaya", cx);
+        assert_eq!(settled_match_count(&search_bar, cx), 1);
+
+        apply_tool_call_updates(&thread, [finished_read("read-2")], cx);
+        assert_eq!(
+            tool_call_group_layout(&thread_view, cx),
+            (vec![(0, 2, false)], vec![0, 1])
+        );
+        assert_eq!(settled_match_count(&search_bar, cx), 0);
     }
 
     #[gpui::test]
@@ -9713,10 +9809,9 @@ pub(crate) mod tests {
                 .expect("prompt should succeed");
             cx.run_until_parked();
         }
-        thread_view.update_in(cx, |view, window, cx| {
+        thread_view.update(cx, |view, cx| {
             view.toggle_collapse(
                 thread_collapse::CollapseKey::ToolCalls(acp_v1::ToolCallId::new("read-3")),
-                window,
                 cx,
             );
         });

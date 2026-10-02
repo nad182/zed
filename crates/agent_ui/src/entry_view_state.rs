@@ -125,18 +125,25 @@ impl EntryViewState {
         self.is_entry_content_visible(entry_ix)
     }
 
-    pub(crate) fn sync_presentation(&mut self, thread: &AcpThread, cx: &App) -> Vec<Range<usize>> {
+    pub(crate) fn sync_presentation(
+        &mut self,
+        thread: &Entity<AcpThread>,
+        cx: &mut Context<Self>,
+    ) -> Vec<Range<usize>> {
         let collapse_enabled = AgentSettings::get_global(cx).collapse_finished_turns;
         if !collapse_enabled && self.presentation.iter().all(EntryPresentation::is_full) {
             return Vec::new();
         }
         let presentation = if collapse_enabled {
-            self.layout(thread, cx)
+            self.layout(thread.read(cx), cx)
         } else {
             Vec::new()
         };
         let changed = changed_ranges(&self.presentation, &presentation);
         self.presentation = presentation;
+        if !changed.is_empty() {
+            cx.emit(PresentationChanged);
+        }
         changed
     }
 
@@ -637,6 +644,10 @@ impl EntryViewState {
 }
 
 impl EventEmitter<EntryViewEvent> for EntryViewState {}
+
+pub struct PresentationChanged;
+
+impl EventEmitter<PresentationChanged> for EntryViewState {}
 
 pub struct EntryViewEvent {
     pub entry_index: usize,

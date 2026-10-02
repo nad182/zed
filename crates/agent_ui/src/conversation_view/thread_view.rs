@@ -6343,7 +6343,7 @@ impl ThreadView {
         let thread = self.thread.clone();
         let changed = self
             .entry_view_state
-            .update(cx, |state, cx| state.sync_presentation(thread.read(cx), cx));
+            .update(cx, |state, cx| state.sync_presentation(&thread, cx));
         if changed.is_empty() {
             return;
         }
@@ -6374,12 +6374,7 @@ impl ThreadView {
         }
     }
 
-    pub(super) fn toggle_collapse(
-        &mut self,
-        key: CollapseKey,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn toggle_collapse(&mut self, key: CollapseKey, cx: &mut Context<Self>) {
         // Keep the clicked row in place instead of snapping to the end.
         if !self.entry_view_state.read(cx).is_expanded(&key) {
             self.list_state.pause_following_tail();
@@ -6387,8 +6382,6 @@ impl ThreadView {
         self.entry_view_state
             .update(cx, |state, _cx| state.toggle_expanded(key));
         self.sync_presentation(cx);
-        self.refresh_thread_search(window, cx);
-        cx.notify();
     }
 
     fn render_collapse_header(
@@ -6426,9 +6419,11 @@ impl ThreadView {
                             .color(Color::Muted)
                             .aria_expanded(*is_expanded)
                             .tab_index(0_isize)
-                            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                                this.toggle_collapse(key.clone(), window, cx);
-                            })),
+                            .on_click(cx.listener(
+                                move |this, _event: &ClickEvent, _window, cx| {
+                                    this.toggle_collapse(key.clone(), cx);
+                                },
+                            )),
                     ),
             )
             .into_any_element()

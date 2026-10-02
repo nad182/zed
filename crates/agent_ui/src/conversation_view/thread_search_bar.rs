@@ -23,7 +23,7 @@ use theme_settings::ThemeSettings;
 use ui::{IconButtonShape, Tooltip, prelude::*};
 use util::paths::PathMatcher;
 
-use crate::entry_view_state::EntryViewState;
+use crate::entry_view_state::{EntryViewState, PresentationChanged};
 
 actions!(
     agent,
@@ -202,6 +202,15 @@ impl ThreadSearchBar {
                 }
             },
         );
+        let presentation_subscription = cx.subscribe_in(
+            &entry_view_state,
+            window,
+            |this, _entry_view_state, _: &PresentationChanged, window, cx| {
+                if this.is_active {
+                    this.schedule_update_matches(window, cx);
+                }
+            },
+        );
         cx.on_release(|this, cx| {
             this.clear_highlights_impl(cx);
         })
@@ -221,7 +230,11 @@ impl ThreadSearchBar {
             is_active: false,
             _update_matches_task: None,
             _search_task: None,
-            _subscriptions: vec![editor_subscription, thread_subscription],
+            _subscriptions: vec![
+                editor_subscription,
+                thread_subscription,
+                presentation_subscription,
+            ],
             patch_buffer_subscriptions: HashMap::default(),
         }
     }
