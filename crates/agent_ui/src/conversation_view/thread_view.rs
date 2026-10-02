@@ -55,7 +55,7 @@ use super::elicitation::{
 use super::thread_collapse::{
     CollapseKey, Content, Header, has_pending_request_elicitation, tool_call_renders_nothing,
 };
-use super::turn_ownership::{TurnOutcome, TurnOwner, TurnOwnership, TurnRecord};
+use super::turn_lifecycle::{TurnLifecycle, TurnOwner, TurnRecord};
 use super::*;
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
@@ -676,10 +676,7 @@ pub struct TurnFields {
     pub turn_started_at: Option<Instant>,
     pub turn_tokens: Option<u64>,
     pub reported_activity_generation: Option<u64>,
-    pub(crate) turn_owner: TurnOwnership,
-    pub(crate) turn_in_flight: bool,
-    pub(crate) turn_outcome: Option<TurnOutcome>,
-    pub(crate) reported_turn_duration: Option<Duration>,
+    pub(crate) turn_lifecycle: TurnLifecycle,
 }
 
 /// How a tool call is rendered relative to its surroundings.
@@ -1065,7 +1062,7 @@ impl ThreadView {
             thread_search_visible: false,
         };
 
-        this.turn_fields.turn_owner = TurnOwnership::new(this.last_user_message_ix(cx));
+        this.turn_fields.turn_lifecycle = TurnLifecycle::new(this.last_user_message_ix(cx));
         this.sync_reported_activity(cx);
         this.sync_generating_indicator(cx);
         this.sync_editor_mode(cx);
@@ -1418,25 +1415,21 @@ impl ThreadView {
     pub(crate) fn start_turn(&mut self, owner: TurnOwner, cx: &mut Context<Self>) -> usize {
         // A previous response may have settled while the new prompt's contents were loading.
         self.thread_error.take();
-        let generation = self.initialize_turn(cx);
-        self.turn_fields.turn_owner.start(owner);
-        generation
+        let previous_turn = self
+            .turn_fields
+            .turn_lifecycle
+            .start(owner, self.turn_elapsed());
+        self.apply_turn_record(previous_turn, cx);
+        self.initialize_turn(cx)
+    }
+
+    fn turn_elapsed(&self) -> Option<Duration> {
+        self.turn_fields
+            .turn_started_at
+            .map(|started| started.elapsed())
     }
 
     fn initialize_turn(&mut self, cx: &mut Context<Self>) -> usize {
-        if self.turn_fields.turn_owner.has_owner() {
-            self.turn_fields
-                .turn_outcome
-                .get_or_insert(TurnOutcome::Interrupted);
-            let elapsed = self
-                .turn_fields
-                .turn_started_at
-                .map(|started| started.elapsed());
-            self.record_turn(elapsed, cx);
-        }
-        self.turn_fields.turn_in_flight = true;
-        self.turn_fields.turn_outcome = None;
-        self.turn_fields.reported_turn_duration = None;
         self.turn_fields.turn_generation += 1;
         let generation = self.turn_fields.turn_generation;
         self.turn_fields.turn_started_at = Some(Instant::now());
@@ -1474,36 +1467,27 @@ impl ThreadView {
         activity_duration: Option<Duration>,
         cx: &mut Context<Self>,
     ) {
-        if !self.turn_fields.turn_in_flight {
-            return;
-        }
-        self.set_turn_outcome(TurnOutcome::from_stop_reason(stop_reason));
-        if self.thread.read(cx).uses_reported_activity() {
-            self.turn_fields.reported_turn_duration = activity_duration;
-        }
+        let reported_duration = if self.thread.read(cx).uses_reported_activity() {
+            activity_duration
+        } else {
+            None
+        };
+        self.turn_fields
+            .turn_lifecycle
+            .finish(stop_reason, reported_duration);
     }
 
     pub(crate) fn interrupt_turn(&mut self) {
-        self.set_turn_outcome(TurnOutcome::Interrupted);
-    }
-
-    fn set_turn_outcome(&mut self, outcome: TurnOutcome) {
-        if self.turn_fields.turn_in_flight
-            && self.turn_fields.turn_outcome != Some(TurnOutcome::Interrupted)
-        {
-            self.turn_fields.turn_outcome = Some(outcome);
-        }
+        self.turn_fields.turn_lifecycle.interrupt();
     }
 
     fn record_turn(&mut self, elapsed: Option<Duration>, cx: &mut Context<Self>) {
-        self.turn_fields.turn_in_flight = false;
-        let outcome = self
-            .turn_fields
-            .turn_outcome
-            .take()
-            .unwrap_or(TurnOutcome::Unknown);
-        let reported_duration = self.turn_fields.reported_turn_duration.take();
-        let Some(user_message_ix) = self.turn_fields.turn_owner.take() else {
+        let turn = self.turn_fields.turn_lifecycle.record(elapsed);
+        self.apply_turn_record(turn, cx);
+    }
+
+    fn apply_turn_record(&mut self, turn: Option<(usize, TurnRecord)>, cx: &mut Context<Self>) {
+        let Some((user_message_ix, record)) = turn else {
             return;
         };
         if !matches!(
@@ -1512,21 +1496,19 @@ impl ThreadView {
         ) {
             return;
         }
-        let record = TurnRecord {
-            duration: reported_duration.or(elapsed),
-            outcome,
-        };
         self.entry_view_state
             .update(cx, |state, _cx| state.record_turn(user_message_ix, record));
         self.sync_presentation(cx);
     }
 
     pub(crate) fn user_message_pushed(&mut self, entry_ix: usize) {
-        self.turn_fields.turn_owner.user_message_pushed(entry_ix);
+        self.turn_fields
+            .turn_lifecycle
+            .user_message_pushed(entry_ix);
     }
 
     pub(crate) fn entries_removed(&mut self, range: &Range<usize>) {
-        self.turn_fields.turn_owner.remove(range);
+        self.turn_fields.turn_lifecycle.remove(range);
     }
 
     fn last_user_message_ix(&self, cx: &App) -> Option<usize> {
@@ -1549,11 +1531,13 @@ impl ThreadView {
 
         if activity != ForegroundActivity::Idle {
             if self.turn_fields.reported_activity_generation != Some(activity_generation) {
-                self.initialize_turn(cx);
                 let last_user_message_ix = self.last_user_message_ix(cx);
-                self.turn_fields
-                    .turn_owner
-                    .start_reported(last_user_message_ix);
+                let previous_turn = self
+                    .turn_fields
+                    .turn_lifecycle
+                    .start_reported(last_user_message_ix, self.turn_elapsed());
+                self.apply_turn_record(previous_turn, cx);
+                self.initialize_turn(cx);
                 self.turn_fields.turn_started_at = started_at;
                 self.turn_fields.reported_activity_generation = Some(activity_generation);
             }
@@ -6434,7 +6418,7 @@ impl ThreadView {
         // An owned turn without a record is between `Stopped` and `stop_turn`, which runs once the
         // send task resolves, so it must not collapse before its outcome is recorded.
         let last_turn_is_live_hint = has_pending_request_elicitation(thread.read(cx), cx)
-            || self.turn_fields.turn_owner.has_owner();
+            || self.turn_fields.turn_lifecycle.is_live();
         let changed = self.entry_view_state.update(cx, |state, cx| {
             state.sync_presentation(&thread, last_turn_is_live_hint, cx)
         });

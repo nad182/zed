@@ -26,7 +26,7 @@ use workspace::Workspace;
 use crate::conversation_view::thread_collapse::{
     CollapseKey, Content, EntryPresentation, LayoutInput, entry_kind, layout,
 };
-use crate::conversation_view::turn_ownership::TurnRecord;
+use crate::conversation_view::turn_lifecycle::TurnRecord;
 use crate::message_editor::{MessageEditor, MessageEditorEvent, SharedSessionCapabilities};
 
 /// Maps an entry index through the removal of `removed` (a contiguous range of

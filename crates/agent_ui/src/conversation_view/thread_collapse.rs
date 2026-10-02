@@ -11,7 +11,7 @@ use util::time::duration_alt_display;
 
 use super::STOPWATCH_THRESHOLD;
 use super::elicitation::should_render_elicitation;
-use super::turn_ownership::{TurnOutcome, TurnRecord};
+use super::turn_lifecycle::{TurnOutcome, TurnRecord};
 use crate::completion_provider::pluralize;
 
 const MIN_TOOL_CALLS_PER_GROUP: usize = 2;
