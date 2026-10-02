@@ -359,9 +359,13 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub expand_terminal_card: Option<bool>,
-    /// Whether to collapse runs of consecutive finished tool calls in the agent panel
-    /// into a single expandable row. Tool calls that show a diff, subagents and calls
-    /// awaiting approval stay visible.
+    /// Whether to collapse the work of finished turns in the agent panel. Once a turn
+    /// ends on its final answer, everything before that answer (messages, thinking, tool
+    /// calls and edits) collapses into a single "Worked for …" row that can be expanded.
+    /// Turns that were cancelled or stopped by an error stay expanded. Within expanded
+    /// and in-progress turns, runs of consecutive finished tool calls collapse into a
+    /// single expandable row; tool calls that show a diff, subagents and calls awaiting
+    /// approval stay visible.
     ///
     /// Default: false
     pub collapse_finished_turns: Option<bool>,

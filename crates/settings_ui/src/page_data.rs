@@ -9006,7 +9006,7 @@ fn ai_page(cx: &App) -> SettingsPage {
             }),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Collapse Finished Turns",
-                description: "Collapse runs of consecutive finished tool calls in the agent panel into a single expandable row. Tool calls that show a diff, subagents and calls awaiting approval stay visible.",
+                description: "Collapse everything before the final answer of a finished turn into a single expandable row, and group runs of consecutive finished tool calls. Cancelled or failed turns, tool calls that show a diff, subagents and calls awaiting approval stay visible.",
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("agent.collapse_finished_turns"),
