@@ -127,6 +127,11 @@ impl EntryViewState {
         self.turn_records.insert(user_message_ix, record);
     }
 
+    #[cfg(test)]
+    pub(crate) fn turn_record(&self, user_message_ix: usize) -> Option<&TurnRecord> {
+        self.turn_records.get(&user_message_ix)
+    }
+
     pub(crate) fn presentation(&self, entry_ix: usize) -> Option<&EntryPresentation> {
         self.presentation.get(entry_ix)
     }
