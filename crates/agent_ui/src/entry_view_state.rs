@@ -150,7 +150,7 @@ impl EntryViewState {
     pub(crate) fn sync_presentation(
         &mut self,
         thread: &Entity<AcpThread>,
-        pending_elicitation: bool,
+        last_turn_is_live_hint: bool,
         cx: &mut Context<Self>,
     ) -> Vec<Range<usize>> {
         let collapse_enabled = AgentSettings::get_global(cx).collapse_finished_turns;
@@ -158,7 +158,7 @@ impl EntryViewState {
             return Vec::new();
         }
         let presentation = if collapse_enabled {
-            self.layout(thread.read(cx), pending_elicitation, cx)
+            self.layout(thread.read(cx), last_turn_is_live_hint, cx)
         } else {
             Vec::new()
         };
@@ -592,7 +592,7 @@ impl EntryViewState {
     fn layout(
         &self,
         thread: &AcpThread,
-        pending_elicitation: bool,
+        last_turn_is_live_hint: bool,
         cx: &App,
     ) -> Vec<EntryPresentation> {
         let entries = thread.entries();
@@ -612,7 +612,7 @@ impl EntryViewState {
             kinds: &kinds,
             tool_call_ids: &tool_call_ids,
             tail_is_growing: is_generating,
-            last_turn_is_live: is_generating || pending_elicitation,
+            last_turn_is_live: is_generating || last_turn_is_live_hint,
             turn_records: &self.turn_records,
             expanded: &self.expanded,
         })

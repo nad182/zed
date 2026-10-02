@@ -677,6 +677,7 @@ pub struct TurnFields {
     pub turn_tokens: Option<u64>,
     pub reported_activity_generation: Option<u64>,
     pub(crate) turn_owner: TurnOwnership,
+    pub(crate) turn_in_flight: bool,
     pub(crate) turn_outcome: Option<TurnOutcome>,
     pub(crate) reported_turn_duration: Option<Duration>,
 }
@@ -1433,6 +1434,7 @@ impl ThreadView {
                 .map(|started| started.elapsed());
             self.record_turn(elapsed, cx);
         }
+        self.turn_fields.turn_in_flight = true;
         self.turn_fields.turn_outcome = None;
         self.turn_fields.reported_turn_duration = None;
         self.turn_fields.turn_generation += 1;
@@ -1472,6 +1474,9 @@ impl ThreadView {
         activity_duration: Option<Duration>,
         cx: &mut Context<Self>,
     ) {
+        if !self.turn_fields.turn_in_flight {
+            return;
+        }
         self.set_turn_outcome(TurnOutcome::from_stop_reason(stop_reason));
         if self.thread.read(cx).uses_reported_activity() {
             self.turn_fields.reported_turn_duration = activity_duration;
@@ -1483,12 +1488,15 @@ impl ThreadView {
     }
 
     fn set_turn_outcome(&mut self, outcome: TurnOutcome) {
-        if self.turn_fields.turn_outcome != Some(TurnOutcome::Interrupted) {
+        if self.turn_fields.turn_in_flight
+            && self.turn_fields.turn_outcome != Some(TurnOutcome::Interrupted)
+        {
             self.turn_fields.turn_outcome = Some(outcome);
         }
     }
 
     fn record_turn(&mut self, elapsed: Option<Duration>, cx: &mut Context<Self>) {
+        self.turn_fields.turn_in_flight = false;
         let outcome = self
             .turn_fields
             .turn_outcome
@@ -6437,9 +6445,12 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
 impl ThreadView {
     pub(crate) fn sync_presentation(&mut self, cx: &mut Context<Self>) {
         let thread = self.thread.clone();
-        let pending_elicitation = has_pending_request_elicitation(thread.read(cx), cx);
+        // An owned turn without a record is between `Stopped` and `stop_turn`, which runs once the
+        // send task resolves, so it must not collapse before its outcome is recorded.
+        let last_turn_is_live_hint = has_pending_request_elicitation(thread.read(cx), cx)
+            || self.turn_fields.turn_owner.has_owner();
         let changed = self.entry_view_state.update(cx, |state, cx| {
-            state.sync_presentation(&thread, pending_elicitation, cx)
+            state.sync_presentation(&thread, last_turn_is_live_hint, cx)
         });
         if changed.is_empty() {
             return;
