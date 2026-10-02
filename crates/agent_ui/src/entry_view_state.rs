@@ -1,6 +1,6 @@
 use std::{ops::Range, sync::Arc};
 
-use acp_thread::{AcpThread, AgentThreadEntry, AssistantMessageChunk, ToolCall};
+use acp_thread::{AcpThread, AgentThreadEntry, AssistantMessageChunk, ThreadStatus, ToolCall};
 use agent::ThreadStore;
 use agent_client_protocol::schema::v1 as acp_v1;
 use agent_settings::AgentSettings;
@@ -23,6 +23,9 @@ use theme_settings::ThemeSettings;
 use ui::{Context, TextSize};
 use workspace::Workspace;
 
+use crate::conversation_view::thread_collapse::{
+    CollapseKey, Content, EntryPresentation, LayoutInput, entry_kind, layout,
+};
 use crate::message_editor::{MessageEditor, MessageEditorEvent, SharedSessionCapabilities};
 
 /// Maps an entry index through the removal of `removed` (a contiguous range of
@@ -37,6 +40,27 @@ fn reindex_after_removal(index: usize, removed: &Range<usize>) -> Option<usize> 
     }
 }
 
+// Entries missing from either side count as fully shown, since `presentation` may be
+// shorter than the thread while collapsing is off.
+fn changed_ranges(old: &[EntryPresentation], new: &[EntryPresentation]) -> Vec<Range<usize>> {
+    let is_unchanged = |entry_ix: usize| match (old.get(entry_ix), new.get(entry_ix)) {
+        (Some(old), Some(new)) => old == new,
+        (Some(only), None) | (None, Some(only)) => only.is_full(),
+        (None, None) => true,
+    };
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    for entry_ix in 0..old.len().max(new.len()) {
+        if is_unchanged(entry_ix) {
+            continue;
+        }
+        match ranges.last_mut() {
+            Some(range) if range.end == entry_ix => range.end += 1,
+            _ => ranges.push(entry_ix..entry_ix + 1),
+        }
+    }
+    ranges
+}
+
 pub struct EntryViewState {
     workspace: WeakEntity<Workspace>,
     project: WeakEntity<Project>,
@@ -49,6 +73,8 @@ pub struct EntryViewState {
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
     expanded_compactions: HashSet<usize>,
     expanded_tool_calls: HashSet<acp_v1::ToolCallId>,
+    presentation: Vec<EntryPresentation>,
+    expanded: HashSet<CollapseKey>,
 }
 
 impl EntryViewState {
@@ -71,7 +97,54 @@ impl EntryViewState {
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
+            presentation: Vec::new(),
+            expanded: HashSet::default(),
         }
+    }
+
+    pub(crate) fn is_expanded(&self, key: &CollapseKey) -> bool {
+        self.expanded.contains(key)
+    }
+
+    pub(crate) fn toggle_expanded(&mut self, key: CollapseKey) {
+        if !self.expanded.remove(&key) {
+            self.expanded.insert(key);
+        }
+    }
+
+    pub(crate) fn presentation(&self, entry_ix: usize) -> Option<&EntryPresentation> {
+        self.presentation.get(entry_ix)
+    }
+
+    pub(crate) fn is_entry_content_visible(&self, entry_ix: usize) -> bool {
+        self.presentation(entry_ix)
+            .is_none_or(|presentation| presentation.content != Content::Hidden)
+    }
+
+    pub(crate) fn are_thoughts_visible(&self, entry_ix: usize) -> bool {
+        self.is_entry_content_visible(entry_ix)
+    }
+
+    pub(crate) fn sync_presentation(
+        &mut self,
+        thread: &Entity<AcpThread>,
+        cx: &mut Context<Self>,
+    ) -> Vec<Range<usize>> {
+        let collapse_enabled = AgentSettings::get_global(cx).collapse_finished_turns;
+        if !collapse_enabled && self.presentation.iter().all(EntryPresentation::is_full) {
+            return Vec::new();
+        }
+        let presentation = if collapse_enabled {
+            self.layout(thread.read(cx), cx)
+        } else {
+            Vec::new()
+        };
+        let changed = changed_ranges(&self.presentation, &presentation);
+        self.presentation = presentation;
+        if !changed.is_empty() {
+            cx.emit(PresentationChanged);
+        }
+        changed
     }
 
     pub(crate) fn is_tool_call_expanded(&self, tool_call_id: &acp_v1::ToolCallId) -> bool {
@@ -493,8 +566,32 @@ impl EntryViewState {
         }
     }
 
+    fn layout(&self, thread: &AcpThread, cx: &App) -> Vec<EntryPresentation> {
+        let entries = thread.entries();
+        let kinds = entries
+            .iter()
+            .map(|entry| entry_kind(entry, thread, cx))
+            .collect::<Vec<_>>();
+        let tool_call_ids = entries
+            .iter()
+            .map(|entry| match entry {
+                AgentThreadEntry::ToolCall(tool_call) => Some(tool_call.id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        layout(LayoutInput {
+            kinds: &kinds,
+            tool_call_ids: &tool_call_ids,
+            tail_is_growing: matches!(thread.status(), ThreadStatus::Generating),
+            expanded: &self.expanded,
+        })
+    }
+
     pub fn remove(&mut self, range: Range<usize>) {
         self.entries.drain(range.clone());
+        let presentation_len = self.presentation.len();
+        self.presentation
+            .drain(range.start.min(presentation_len)..range.end.min(presentation_len));
 
         self.expanded_compactions = self
             .expanded_compactions
@@ -547,6 +644,10 @@ impl EntryViewState {
 }
 
 impl EventEmitter<EntryViewEvent> for EntryViewState {}
+
+pub(crate) struct PresentationChanged;
+
+impl EventEmitter<PresentationChanged> for EntryViewState {}
 
 pub struct EntryViewEvent {
     pub entry_index: usize,

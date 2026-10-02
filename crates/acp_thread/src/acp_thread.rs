@@ -1598,6 +1598,15 @@ impl ToolCall {
             })
     }
 
+    pub fn shows_diff(&self) -> bool {
+        matches!(self.kind(), acp_v2::ToolKind::Edit)
+            || self.diffs().next().is_some()
+            || self
+                .content()
+                .iter()
+                .any(|content| matches!(content, ToolCallContent::DiffPatch { .. }))
+    }
+
     pub fn terminals(&self) -> impl Iterator<Item = &Entity<Terminal>> {
         self.structured_content
             .iter()
@@ -13579,6 +13588,57 @@ mod tests {
                 .upgrade()
                 .expect("resolved location should keep an open buffer");
             assert_eq!(buffer.read(cx).text(), "skill body");
+        });
+    }
+
+    #[gpui::test]
+    fn test_tool_call_shows_diff(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            let languages = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
+            let terminals = HashMap::default();
+            let mut tool_call = |update: acp_v2::ToolCallUpdate| {
+                ToolCall::from_patch(
+                    acp_v1::ToolCallId::new(update.tool_call_id.0.clone()),
+                    ToolCallPatch::protocol(update),
+                    languages.clone(),
+                    &terminals,
+                    cx,
+                )
+                .expect("tool call")
+            };
+
+            let read = tool_call(
+                acp_v2::ToolCallUpdate::new("read")
+                    .kind(acp_v2::ToolKind::Read)
+                    .content(vec!["output".into()]),
+            );
+            assert!(!read.shows_diff());
+
+            let edit = tool_call(acp_v2::ToolCallUpdate::new("edit").kind(acp_v2::ToolKind::Edit));
+            assert!(edit.shows_diff());
+
+            let patch = tool_call(
+                acp_v2::ToolCallUpdate::new("patch")
+                    .kind(acp_v2::ToolKind::Other)
+                    .content(vec![acp_v2::ToolCallContent::Diff(acp_v2::Diff::patch(
+                        "diff --git a/one b/one\n",
+                        vec![],
+                    ))]),
+            );
+            assert!(patch.shows_diff());
+
+            let legacy_diff = ToolCall::from_acp(
+                acp_v1::ToolCall::new("legacy", "Write").content(vec![
+                    acp_v1::ToolCallContent::Diff(acp_v1::Diff::new("file.rs", "new text")),
+                ]),
+                None,
+                languages.clone(),
+                &terminals,
+                cx,
+            )
+            .expect("tool call");
+            assert!(legacy_diff.shows_diff());
         });
     }
 

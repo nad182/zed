@@ -5,7 +5,7 @@ use crate::{
     thread_metadata_store::{ThreadId, ThreadMetadataStore},
 };
 use agent_client_protocol::schema::{v1 as acp_v1, v2 as acp_v2};
-use std::cell::RefCell;
+use std::{cell::RefCell, ops::Range};
 
 use acp_thread::{
     Elicitation, ElicitationEntryId, ElicitationStatus, ForegroundActivity,
@@ -52,6 +52,7 @@ use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
 use super::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
 };
+use super::thread_collapse::{CollapseKey, Content, Header, tool_call_renders_nothing};
 use super::*;
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
@@ -6338,6 +6339,131 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
 }
 
 impl ThreadView {
+    pub(crate) fn sync_presentation(&mut self, cx: &mut Context<Self>) {
+        let thread = self.thread.clone();
+        let changed = self
+            .entry_view_state
+            .update(cx, |state, cx| state.sync_presentation(&thread, cx));
+        if changed.is_empty() {
+            return;
+        }
+        self.apply_presentation_changes(changed, cx);
+        cx.notify();
+    }
+
+    fn apply_presentation_changes(&self, changed: Vec<Range<usize>>, cx: &App) {
+        let scroll_top = self.list_state.logical_scroll_top();
+        let entry_view_state = self.entry_view_state.read(cx);
+        let scroll_top_is_hidden = !self.list_state.is_following_tail()
+            && !entry_view_state.is_entry_content_visible(scroll_top.item_ix);
+        for range in changed {
+            if scroll_top_is_hidden && range.contains(&scroll_top.item_ix) {
+                let header_ix = (range.start..=scroll_top.item_ix).rev().find(|&entry_ix| {
+                    entry_view_state
+                        .presentation(entry_ix)
+                        .is_some_and(|presentation| presentation.header.is_some())
+                });
+                if let Some(header_ix) = header_ix {
+                    self.list_state.scroll_to(ListOffset {
+                        item_ix: header_ix,
+                        offset_in_item: px(0.),
+                    });
+                }
+            }
+            self.list_state.remeasure_items(range);
+        }
+    }
+
+    pub(super) fn toggle_collapse(&mut self, key: CollapseKey, cx: &mut Context<Self>) {
+        // Keep the clicked row in place instead of snapping to the end.
+        if !self.entry_view_state.read(cx).is_expanded(&key) {
+            self.list_state.pause_following_tail();
+        }
+        self.entry_view_state
+            .update(cx, |state, _cx| state.toggle_expanded(key));
+        self.sync_presentation(cx);
+    }
+
+    fn render_collapse_header(
+        &self,
+        entry_ix: usize,
+        header: &Header,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let Header::ToolCallGroup {
+            key,
+            count,
+            is_expanded,
+        } = header;
+        let chevron = if *is_expanded {
+            IconName::ChevronDown
+        } else {
+            IconName::ChevronRight
+        };
+        let key = key.clone();
+        let label = format!("{count} {}", pluralize("tool call", *count));
+        h_flex()
+            .px_5()
+            .py_1p5()
+            .child(
+                div()
+                    .debug_selector(move || format!("tool-call-group-{entry_ix}"))
+                    .child(
+                        Button::new(("tool-call-group", entry_ix), label)
+                            .start_icon(
+                                Icon::new(chevron)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .label_size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .aria_expanded(*is_expanded)
+                            .tab_index(0_isize)
+                            .on_click(cx.listener(
+                                move |this, _event: &ClickEvent, _window, cx| {
+                                    this.toggle_collapse(key.clone(), cx);
+                                },
+                            )),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_standalone_tool_call(
+        &self,
+        entry_ix: usize,
+        tool_call: &ToolCall,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        if tool_call_renders_nothing(tool_call, cx) {
+            return None;
+        }
+
+        let tool_call = self.render_any_tool_call(
+            self.thread.read(cx).session_id(),
+            entry_ix,
+            tool_call,
+            &self.focus_handle(cx),
+            ToolCallLayout::Standalone,
+            window,
+            cx,
+        );
+
+        Some(
+            if let Some(handle) = self
+                .entry_view_state
+                .read(cx)
+                .entry(entry_ix)
+                .and_then(|entry| entry.focus_handle(cx))
+            {
+                tool_call.track_focus(&handle).into_any()
+            } else {
+                tool_call.into_any()
+            },
+        )
+    }
+
     fn render_entries(&mut self, cx: &mut Context<Self>) -> List {
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let centered_container = move |content: AnyElement| {
@@ -6386,6 +6512,14 @@ impl ThreadView {
                 .entries()
                 .get(entry_ix.saturating_sub(1))
                 .is_none_or(|entry| !entry.is_indented());
+
+        let presentation = self.entry_view_state.read(cx).presentation(entry_ix);
+        let collapse_header = presentation
+            .and_then(|presentation| presentation.header.as_ref())
+            .map(|header| self.render_collapse_header(entry_ix, header, cx));
+        if presentation.is_some_and(|presentation| presentation.content == Content::Hidden) {
+            return collapse_header.unwrap_or_else(|| Empty.into_any());
+        }
 
         let mut assistant_message_is_blank = false;
 
@@ -6644,55 +6778,9 @@ impl ThreadView {
                         .into_any()
                 }
             }
-            AgentThreadEntry::ToolCall(tool_call) => {
-                // A canceled tool call that produced visible output is still worth
-                // showing, but one that was canceled before producing anything just
-                // renders as a useless "Canceled" card — hide those entirely.
-                if matches!(tool_call.status(), ToolCallStatus::Canceled) {
-                    let has_visible_content =
-                        tool_call.content().iter().any(|content| match content {
-                            ToolCallContent::ContentBlock { block, .. } => {
-                                block.visible_content(cx)
-                            }
-                            ToolCallContent::Diff(_)
-                            | ToolCallContent::LegacyDiff { .. }
-                            | ToolCallContent::Terminal { .. } => true,
-                            ToolCallContent::DiffPatch { render, .. } => {
-                                !render.files.is_empty()
-                                    || render.fallback.as_ref().is_some_and(|markdown| {
-                                        !markdown.read(cx).source().is_empty()
-                                    })
-                            }
-                            ToolCallContent::Other { markdown, .. } => {
-                                !markdown.read(cx).source().is_empty()
-                            }
-                        });
-                    if !has_visible_content {
-                        return Empty.into_any();
-                    }
-                }
-
-                let tool_call = self.render_any_tool_call(
-                    self.thread.read(cx).session_id(),
-                    entry_ix,
-                    tool_call,
-                    &self.focus_handle(cx),
-                    ToolCallLayout::Standalone,
-                    window,
-                    cx,
-                );
-
-                if let Some(handle) = self
-                    .entry_view_state
-                    .read(cx)
-                    .entry(entry_ix)
-                    .and_then(|entry| entry.focus_handle(cx))
-                {
-                    tool_call.track_focus(&handle).into_any()
-                } else {
-                    tool_call.into_any()
-                }
-            }
+            AgentThreadEntry::ToolCall(tool_call) => self
+                .render_standalone_tool_call(entry_ix, tool_call, window, cx)
+                .unwrap_or_else(|| Empty.into_any()),
             AgentThreadEntry::Elicitation(elicitation_id) => {
                 let thread = self.thread.read(cx);
                 if let Some((_, elicitation)) = thread.elicitation(elicitation_id)
@@ -6717,6 +6805,15 @@ impl ThreadView {
             AgentThreadEntry::ContextCompaction(compaction) => {
                 self.render_context_compaction(entry_ix, compaction, window, cx)
             }
+        };
+
+        let primary = match collapse_header {
+            Some(collapse_header) => v_flex()
+                .w_full()
+                .child(collapse_header)
+                .child(primary)
+                .into_any_element(),
+            None => primary,
         };
 
         let is_subagent_output = self.is_subagent()
@@ -8468,12 +8565,7 @@ impl ThreadView {
             matches!(tool_call.status(), ToolCallStatus::WaitingForConfirmation);
         let is_terminal_tool = matches!(tool_call.kind(), acp_v2::ToolKind::Execute);
 
-        let is_edit = matches!(tool_call.kind(), acp_v2::ToolKind::Edit)
-            || tool_call.diffs().next().is_some()
-            || tool_call
-                .content()
-                .iter()
-                .any(|content| matches!(content, ToolCallContent::DiffPatch { .. }));
+        let is_edit = tool_call.shows_diff();
 
         let is_cancelled_edit = is_edit && matches!(tool_call.status(), ToolCallStatus::Canceled);
         let (has_revealed_diff, tool_call_output_focus, tool_call_output_focus_handle) = tool_call
