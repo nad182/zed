@@ -2349,12 +2349,13 @@ impl ThreadView {
     pub fn retry_generation(&mut self, cx: &mut Context<Self>) {
         self.thread_error.take();
 
-        let thread = &self.thread;
-        if !thread.read(cx).can_retry(cx) {
+        if !self.thread.read(cx).can_retry(cx) {
             return;
         }
 
-        let task = thread.update(cx, |thread, cx| thread.retry(cx));
+        let owner = self.turn_fields.turn_lifecycle.retry_owner();
+        let generation = self.start_turn(owner, cx);
+        let task = self.thread.update(cx, |thread, cx| thread.retry(cx));
         let submission_id = task.id;
         self.current_submission = Some(submission_id);
         cx.emit(AcpThreadViewEvent::Interacted);
@@ -2364,6 +2365,7 @@ impl ThreadView {
             let result = task.await;
 
             this.update(cx, |this, cx| {
+                this.stop_turn(generation, cx);
                 if this.current_submission != Some(submission_id) {
                     return;
                 }

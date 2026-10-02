@@ -50,6 +50,7 @@ pub(crate) struct TurnLifecycle {
     in_flight: bool,
     outcome: Option<TurnOutcome>,
     reported_duration: Option<Duration>,
+    last_recorded_owner: TurnOwner,
 }
 
 impl TurnLifecycle {
@@ -120,16 +121,24 @@ impl TurnLifecycle {
         self.in_flight = false;
         let outcome = self.outcome.take().unwrap_or(TurnOutcome::Unknown);
         let reported_duration = self.reported_duration.take();
-        match std::mem::take(&mut self.owner) {
-            TurnOwner::UserMessage(user_message_ix) => Some((
+        let user_message_ix = match std::mem::take(&mut self.owner) {
+            TurnOwner::UserMessage(user_message_ix) => Some(user_message_ix),
+            TurnOwner::None | TurnOwner::NextUserMessage => None,
+        };
+        self.last_recorded_owner = user_message_ix.map_or(TurnOwner::None, TurnOwner::UserMessage);
+        user_message_ix.map(|user_message_ix| {
+            (
                 user_message_ix,
                 TurnRecord {
                     duration: reported_duration.or(elapsed),
                     outcome,
                 },
-            )),
-            TurnOwner::None | TurnOwner::NextUserMessage => None,
-        }
+            )
+        })
+    }
+
+    pub(crate) fn retry_owner(&self) -> TurnOwner {
+        self.last_recorded_owner
     }
 
     pub(crate) fn is_live(&self) -> bool {
@@ -137,9 +146,11 @@ impl TurnLifecycle {
     }
 
     pub(crate) fn remove(&mut self, removed: &Range<usize>) {
-        if let TurnOwner::UserMessage(user_message_ix) = self.owner {
-            self.owner = reindex_after_removal(user_message_ix, removed)
-                .map_or(TurnOwner::None, TurnOwner::UserMessage);
+        for owner in [&mut self.owner, &mut self.last_recorded_owner] {
+            if let TurnOwner::UserMessage(user_message_ix) = *owner {
+                *owner = reindex_after_removal(user_message_ix, removed)
+                    .map_or(TurnOwner::None, TurnOwner::UserMessage);
+            }
         }
         self.newest_owned_user_message_ix = self.newest_owned_user_message_ix.and_then(|newest| {
             reindex_after_removal(newest, removed).or_else(|| removed.start.checked_sub(1))
@@ -302,6 +313,29 @@ mod tests {
             outcome(lifecycle.record(None)),
             Some(TurnOutcome::Interrupted)
         );
+    }
+
+    #[test]
+    fn retries_resume_the_owner_of_the_last_recorded_turn() {
+        let mut lifecycle = TurnLifecycle::default();
+        lifecycle.start(TurnOwner::UserMessage(3), None);
+        lifecycle.record(None);
+        lifecycle.start(TurnOwner::None, None);
+        lifecycle.record(None);
+        assert_eq!(lifecycle.retry_owner(), TurnOwner::None);
+
+        lifecycle.start(TurnOwner::NextUserMessage, None);
+        lifecycle.record(None);
+        assert_eq!(lifecycle.retry_owner(), TurnOwner::None);
+
+        lifecycle.start(TurnOwner::UserMessage(5), None);
+        lifecycle.record(None);
+        assert_eq!(lifecycle.retry_owner(), TurnOwner::UserMessage(5));
+
+        lifecycle.remove(&(1..3));
+        assert_eq!(lifecycle.retry_owner(), TurnOwner::UserMessage(3));
+        lifecycle.remove(&(3..4));
+        assert_eq!(lifecycle.retry_owner(), TurnOwner::None);
     }
 
     #[test]

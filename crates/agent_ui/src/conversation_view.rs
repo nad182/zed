@@ -10276,6 +10276,263 @@ pub(crate) mod tests {
         assert_eq!(turn_summaries(&thread_view, cx).len(), 1);
     }
 
+    #[derive(Clone, Default)]
+    struct FailThenRetryConnection {
+        thread: Arc<Mutex<Option<WeakEntity<AcpThread>>>>,
+        prompt_count: Arc<Mutex<usize>>,
+        failing_prompt_ix: usize,
+        pending_retry: Arc<
+            Mutex<Option<futures::channel::oneshot::Sender<gpui::Result<acp_v1::PromptResponse>>>>,
+        >,
+    }
+
+    impl FailThenRetryConnection {
+        fn finish_retry(&self, response: gpui::Result<acp_v1::PromptResponse>) {
+            self.pending_retry
+                .lock()
+                .take()
+                .expect("a retry should be running")
+                .send(response)
+                .expect("the retry should be waiting for its response");
+        }
+
+        fn answer(
+            &self,
+            updates: Vec<acp_v1::SessionUpdate>,
+            response: impl 'static + Future<Output = gpui::Result<acp_v1::PromptResponse>>,
+            cx: &mut App,
+        ) -> Task<gpui::Result<acp_v1::PromptResponse>> {
+            let thread = self
+                .thread
+                .lock()
+                .clone()
+                .expect("the session should exist");
+            cx.spawn(async move |cx| {
+                for update in updates {
+                    thread.update(cx, |thread, cx| thread.handle_session_update(update, cx))??;
+                }
+                response.await
+            })
+        }
+    }
+
+    impl AgentConnection for FailThenRetryConnection {
+        fn agent_id(&self) -> AgentId {
+            AgentId::new("fail-then-retry")
+        }
+
+        fn telemetry_id(&self) -> SharedString {
+            "fail-then-retry".into()
+        }
+
+        fn auth_methods(&self) -> &[acp_v1::AuthMethod] {
+            &[]
+        }
+
+        fn authenticate(
+            &self,
+            _method_id: acp_v1::AuthMethodId,
+            _cx: &mut App,
+        ) -> Task<gpui::Result<()>> {
+            Task::ready(Ok(()))
+        }
+
+        fn new_session(
+            self: Rc<Self>,
+            project: Entity<Project>,
+            _work_dirs: PathList,
+            cx: &mut App,
+        ) -> Task<gpui::Result<Entity<AcpThread>>> {
+            let thread = build_test_thread(
+                self.clone(),
+                project,
+                "Fail then retry",
+                acp_v1::SessionId::new("fail-then-retry"),
+                cx,
+            );
+            *self.thread.lock() = Some(thread.downgrade());
+            Task::ready(Ok(thread))
+        }
+
+        fn prompt(
+            &self,
+            _params: acp_v1::PromptRequest,
+            cx: &mut App,
+        ) -> Task<gpui::Result<acp_v1::PromptResponse>> {
+            let prompt_ix = {
+                let mut prompt_count = self.prompt_count.lock();
+                *prompt_count += 1;
+                *prompt_count - 1
+            };
+            if prompt_ix == self.failing_prompt_ix {
+                return Task::ready(Err(anyhow!("prompt failed")));
+            }
+            self.answer(
+                vec![
+                    finished_read_update(&format!("read-{prompt_ix}"), "Read file"),
+                    message_update("Answer."),
+                ],
+                async { Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)) },
+                cx,
+            )
+        }
+
+        fn retry(
+            &self,
+            _session_id: &acp_v1::SessionId,
+            _cx: &App,
+        ) -> Option<Rc<dyn acp_thread::AgentSessionRetry>> {
+            Some(Rc::new(self.clone()))
+        }
+
+        fn cancel(&self, _session_id: &acp_v1::SessionId, _cx: &mut App) {}
+
+        fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+            self
+        }
+    }
+
+    impl acp_thread::AgentSessionRetry for FailThenRetryConnection {
+        fn run(&self, cx: &mut App) -> Task<gpui::Result<acp_v1::PromptResponse>> {
+            let (sender, receiver) = futures::channel::oneshot::channel();
+            *self.pending_retry.lock() = Some(sender);
+            self.answer(
+                vec![
+                    finished_read_update("retry-read", "Read file"),
+                    message_update("Done after retry."),
+                ],
+                async move { receiver.await? },
+                cx,
+            )
+        }
+    }
+
+    async fn retry_failed_prompt(
+        cx: &mut TestAppContext,
+    ) -> (
+        FailThenRetryConnection,
+        Entity<ConversationView>,
+        Entity<ThreadView>,
+        &mut VisualTestContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let connection = FailThenRetryConnection::default();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+
+        send_prompt(&conversation_view, "Prompt", cx);
+        assert_eq!(
+            turn_record(&thread_view, 0, cx).map(|record| record.outcome),
+            Some(turn_lifecycle::TurnOutcome::Interrupted)
+        );
+
+        thread_view.update(cx, |view, cx| view.retry_generation(cx));
+        cx.run_until_parked();
+        thread_view.read_with(cx, |view, cx| {
+            assert_eq!(view.thread.read(cx).entries().len(), 3);
+            assert!(view.turn_fields.turn_lifecycle.is_live());
+        });
+        assert_eq!(turn_summaries(&thread_view, cx), vec![]);
+        (connection, conversation_view, thread_view, cx)
+    }
+
+    #[gpui::test]
+    async fn test_successful_retry_finishes_the_failed_turn(cx: &mut TestAppContext) {
+        let (connection, _conversation_view, thread_view, cx) = retry_failed_prompt(cx).await;
+
+        connection.finish_retry(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)));
+        cx.run_until_parked();
+
+        let record = turn_record(&thread_view, 0, cx).expect("the prompt should own its turn");
+        assert_eq!(record.outcome, turn_lifecycle::TurnOutcome::Finished);
+        assert_eq!(
+            turn_summaries(&thread_view, cx),
+            vec![(1, record.duration, false)]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_failed_retry_keeps_the_turn_interrupted(cx: &mut TestAppContext) {
+        let (connection, _conversation_view, thread_view, cx) = retry_failed_prompt(cx).await;
+
+        connection.finish_retry(Err(anyhow!("retry failed")));
+        cx.run_until_parked();
+
+        assert_eq!(
+            turn_record(&thread_view, 0, cx).map(|record| record.outcome),
+            Some(turn_lifecycle::TurnOutcome::Interrupted)
+        );
+        assert_eq!(turn_summaries(&thread_view, cx), vec![]);
+    }
+
+    #[gpui::test]
+    async fn test_superseded_retry_does_not_record_over_the_next_turn(cx: &mut TestAppContext) {
+        let (connection, _conversation_view, thread_view, cx) = retry_failed_prompt(cx).await;
+
+        thread_view.update_in(cx, |view, window, cx| {
+            let contents = Task::ready(Ok(Some((vec!["Follow-up".into()], Vec::new()))));
+            view.send_content(contents, false, window, cx);
+        });
+        cx.run_until_parked();
+        connection.finish_retry(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)));
+        cx.run_until_parked();
+
+        let follow_up_ix = thread_view
+            .read_with(cx, |view, cx| {
+                view.thread
+                    .read(cx)
+                    .entries()
+                    .iter()
+                    .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+            })
+            .expect("the follow-up should be in the thread");
+        assert!(follow_up_ix > 0);
+        assert_eq!(
+            turn_record(&thread_view, 0, cx).map(|record| record.outcome),
+            Some(turn_lifecycle::TurnOutcome::Interrupted)
+        );
+        let record =
+            turn_record(&thread_view, follow_up_ix, cx).expect("the follow-up should own its turn");
+        assert_eq!(record.outcome, turn_lifecycle::TurnOutcome::Finished);
+        assert_eq!(
+            turn_summaries(&thread_view, cx),
+            vec![(follow_up_ix + 1, record.duration, false)]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_retrying_a_failed_command_keeps_the_previous_turn_record(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let connection = FailThenRetryConnection {
+            failing_prompt_ix: 1,
+            ..FailThenRetryConnection::default()
+        };
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+
+        send_prompt(&conversation_view, "Prompt", cx);
+        let record = turn_record(&thread_view, 0, cx).expect("the prompt should own its turn");
+        assert_eq!(record.outcome, turn_lifecycle::TurnOutcome::Finished);
+
+        send_native_command(&thread_view, cx);
+        thread_view.update(cx, |view, cx| view.retry_generation(cx));
+        cx.run_until_parked();
+        connection.finish_retry(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)));
+        cx.run_until_parked();
+
+        assert_eq!(turn_record(&thread_view, 0, cx), Some(record));
+        assert_eq!(
+            turn_summaries(&thread_view, cx),
+            vec![(1, record.duration, false)]
+        );
+    }
+
     #[gpui::test]
     async fn test_request_elicitations_recompute_turn_presentation(cx: &mut TestAppContext) {
         init_test(cx);
