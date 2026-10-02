@@ -53,9 +53,9 @@ use super::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
 };
 use super::thread_collapse::{
-    CollapseKey, Content, Header, TurnOutcome, TurnOwner, TurnOwnership, TurnRecord,
-    has_pending_request_elicitation, tool_call_renders_nothing,
+    CollapseKey, Content, Header, has_pending_request_elicitation, tool_call_renders_nothing,
 };
+use super::turn_ownership::{TurnOutcome, TurnOwner, TurnOwnership, TurnRecord};
 use super::*;
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";

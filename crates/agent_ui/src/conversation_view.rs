@@ -114,6 +114,7 @@ mod message_queue;
 pub(crate) mod thread_collapse;
 mod thread_search_bar;
 mod thread_view;
+pub(crate) mod turn_ownership;
 pub use message_queue::*;
 pub use thread_view::*;
 
@@ -9905,7 +9906,7 @@ pub(crate) mod tests {
         thread_view: &Entity<ThreadView>,
         user_message_ix: usize,
         cx: &mut VisualTestContext,
-    ) -> Option<thread_collapse::TurnRecord> {
+    ) -> Option<turn_ownership::TurnRecord> {
         thread_view.read_with(cx, |view, cx| {
             view.entry_view_state
                 .read(cx)
@@ -9973,7 +9974,7 @@ pub(crate) mod tests {
         ]);
         send_prompt(&conversation_view, "First prompt", cx);
         let record = turn_record(&thread_view, 0, cx).expect("the prompt should own its turn");
-        assert_eq!(record.outcome, thread_collapse::TurnOutcome::Finished);
+        assert_eq!(record.outcome, turn_ownership::TurnOutcome::Finished);
         assert!(record.duration.is_some());
         assert_eq!(
             turn_summaries(&thread_view, cx),
@@ -10046,9 +10047,9 @@ pub(crate) mod tests {
         let record = turn_record(&thread_view, 0, cx).expect("the prompt should own its turn");
         assert_eq!(
             record,
-            thread_collapse::TurnRecord {
+            turn_ownership::TurnRecord {
                 duration: thread.read_with(cx, |thread, _| thread.activity_duration()),
-                outcome: thread_collapse::TurnOutcome::Finished,
+                outcome: turn_ownership::TurnOutcome::Finished,
             }
         );
         assert!(record.duration.is_some());
@@ -10093,7 +10094,7 @@ pub(crate) mod tests {
 
             assert_eq!(
                 turn_record(&thread_view, 0, cx).map(|record| record.outcome),
-                Some(thread_collapse::TurnOutcome::Interrupted),
+                Some(turn_ownership::TurnOutcome::Interrupted),
                 "cancel: {cancel}"
             );
             assert_eq!(turn_summaries(&thread_view, cx), vec![], "cancel: {cancel}");
