@@ -13038,6 +13038,67 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_finished_subagent_tool_calls_end_tool_call_groups(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let finished_subagent = |tool_call_id: &str, meta: serde_json::Value| {
+            json!({
+                "toolCallId": tool_call_id,
+                "title": "Investigate",
+                "status": "completed",
+                "_meta": meta,
+            })
+        };
+        apply_tool_call_updates(
+            &thread,
+            [
+                finished_read("read-1"),
+                finished_read("read-2"),
+                finished_subagent(
+                    "spawned-by-name",
+                    json!({acp_thread::TOOL_NAME_META_KEY: "spawn_agent"}),
+                ),
+                finished_read("read-3"),
+                finished_read("read-4"),
+                finished_subagent(
+                    "spawned-with-session",
+                    json!({acp_thread::SUBAGENT_SESSION_INFO_META_KEY: {
+                        "session_id": "child",
+                        "message_start_index": 0,
+                    }}),
+                ),
+                finished_read("read-5"),
+                finished_read("read-6"),
+            ],
+            cx,
+        );
+
+        thread.read_with(cx, |thread, _| {
+            let subagent_entries = thread
+                .entries()
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    matches!(entry, AgentThreadEntry::ToolCall(tool_call) if tool_call.is_subagent())
+                })
+                .map(|(entry_ix, _)| entry_ix)
+                .collect::<Vec<_>>();
+            assert_eq!(subagent_entries, vec![2, 5]);
+        });
+        assert_eq!(
+            tool_call_group_layout(&thread_view, cx),
+            (
+                vec![(0, 2, false), (3, 2, false), (6, 2, false)],
+                vec![0, 1, 3, 4, 6, 7]
+            )
+        );
+    }
+
+    #[gpui::test]
     async fn test_awaiting_authorization_searches_visible_patch_content(cx: &mut TestAppContext) {
         use agent_client_protocol::schema::v2 as acp_v2;
 
