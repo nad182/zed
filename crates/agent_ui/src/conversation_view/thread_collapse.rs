@@ -4,7 +4,7 @@ use acp_thread::{
     AcpThread, AgentThreadEntry, AssistantMessageChunk, ElicitationStatus, ToolCall,
     ToolCallContent, ToolCallStatus,
 };
-use agent_client_protocol::schema::v1 as acp_v1;
+use agent_client_protocol::schema::v2 as acp_v2;
 use collections::HashSet;
 use gpui::App;
 
@@ -25,7 +25,7 @@ pub(crate) enum EntryKind {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum CollapseKey {
-    ToolCalls(acp_v1::ToolCallId),
+    ToolCalls(acp_v2::ToolCallId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,7 +58,7 @@ impl EntryPresentation {
 
 pub(crate) struct LayoutInput<'a> {
     pub kinds: &'a [EntryKind],
-    pub tool_call_ids: &'a [Option<acp_v1::ToolCallId>],
+    pub tool_call_ids: &'a [Option<acp_v2::ToolCallId>],
     pub tail_is_growing: bool,
     pub expanded: &'a HashSet<CollapseKey>,
 }
@@ -153,7 +153,7 @@ pub(crate) fn entry_kind(entry: &AgentThreadEntry, thread: &AcpThread, cx: &App)
                 EntryKind::Invisible
             }
         }
-        AgentThreadEntry::ToolCall(tool_call) if tool_call.authorization().is_some() => {
+        AgentThreadEntry::ToolCall(tool_call) if tool_call.authorization_id().is_some() => {
             EntryKind::NeedsAction
         }
         AgentThreadEntry::ToolCall(tool_call) => EntryKind::ToolCall {
@@ -170,6 +170,7 @@ pub(crate) fn entry_kind(entry: &AgentThreadEntry, thread: &AcpThread, cx: &App)
             _ => EntryKind::Invisible,
         },
         AgentThreadEntry::ContextCompaction(_) => EntryKind::Aside,
+        AgentThreadEntry::SessionMessage(_) => EntryKind::Answer,
     }
 }
 
@@ -222,8 +223,8 @@ mod tests {
         renders: false,
     };
 
-    fn tool_call_id(entry_ix: usize) -> acp_v1::ToolCallId {
-        acp_v1::ToolCallId::new(format!("tool-{entry_ix}"))
+    fn tool_call_id(entry_ix: usize) -> acp_v2::ToolCallId {
+        acp_v2::ToolCallId::new(format!("tool-{entry_ix}"))
     }
 
     fn layout_of(
