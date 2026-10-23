@@ -42,8 +42,8 @@ pub(crate) enum TurnOwner {
 }
 
 // Prompts that already belong to a turn, including ones restored with the thread, are never
-// claimed again, so activity without a prompt of its own (such as `/compact` on an agent
-// that reports its activity) cannot overwrite the record of an earlier prompt.
+// claimed again, so activity without a new user message of its own cannot overwrite the
+// record of an earlier prompt. Native `/compact` adds an empty marker message that it owns.
 #[derive(Debug, Default)]
 pub(crate) struct TurnLifecycle {
     owner: TurnOwner,

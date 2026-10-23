@@ -13332,6 +13332,37 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_reported_compact_marker_leaves_previous_turn_collapsed(cx: &mut TestAppContext) {
+        let (_conversation_view, thread_view, thread, cx) = reported_activity_thread(cx).await;
+        run_reported_prompt(&thread, "Prompt", cx);
+        report_state(
+            &thread,
+            json!({"state": "idle", "stopReason": "end_turn"}),
+            cx,
+        );
+        let record = turn_record(&thread_view, 0, cx).expect("the prompt should own its turn");
+
+        report_state(&thread, json!({"state": "running"}), cx);
+        thread.update(cx, |thread, cx| {
+            thread
+                .upsert_local_user_message(acp_thread::ClientUserMessageId::new(), Vec::new(), cx)
+                .expect("command marker");
+        });
+        cx.run_until_parked();
+        report_state(
+            &thread,
+            json!({"state": "idle", "stopReason": "end_turn"}),
+            cx,
+        );
+
+        assert_eq!(turn_record(&thread_view, 0, cx), Some(record));
+        assert_eq!(
+            turn_summaries(&thread_view, cx),
+            vec![(1, record.duration, false)]
+        );
+    }
+
+    #[gpui::test]
     async fn test_unconfirmed_gap_keeps_live_reported_turn(cx: &mut TestAppContext) {
         let (_conversation_view, thread_view, thread, cx) = reported_activity_thread(cx).await;
         run_reported_prompt(&thread, "Prompt", cx);
