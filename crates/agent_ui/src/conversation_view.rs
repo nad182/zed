@@ -13141,6 +13141,72 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_subagent_preview_starting_inside_a_group_shows_the_group_row(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let root_view = active_thread(&conversation_view, cx);
+        let root = root_view.read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root.read_with(cx, |thread, _| thread.session_id().clone());
+        let child = conversation_view.update(cx, |view, cx| {
+            create_test_acp_thread(
+                Some(root_session_id),
+                "child",
+                Rc::new(connection.clone()),
+                view.project.clone(),
+                cx,
+            )
+        });
+        root.update(cx, |root, cx| root.register_subagent(child.clone(), cx));
+        cx.run_until_parked();
+
+        child.update(cx, |child, cx| {
+            child.push_user_content_block(None, "Investigate".into(), cx);
+        });
+        apply_tool_call_updates(
+            &child,
+            (1..=10).map(|n| finished_read(&format!("read-{n}"))),
+            cx,
+        );
+        let child_view = conversation_view.read_with(cx, |view, cx| {
+            view.thread_view(child.read(cx).session_id())
+                .expect("the child should have a view")
+        });
+        assert_eq!(
+            tool_call_group_layout(&child_view, cx),
+            (vec![(1, 10, false)], (1..=10).collect())
+        );
+
+        apply_tool_call_updates(
+            &root,
+            [json!({
+                "toolCallId": "spawn",
+                "title": "Investigate",
+                "status": "completed",
+                "_meta": {acp_thread::SUBAGENT_SESSION_INFO_META_KEY: {
+                    "session_id": "child",
+                    "message_start_index": 0,
+                }},
+            })],
+            cx,
+        );
+        root_view.update(cx, |view, cx| {
+            view.entry_view_state.update(cx, |state, _| {
+                state.expand_tool_call(acp_v2::ToolCallId::new("spawn"));
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("tool-call-group-1").is_some());
+    }
+
+    #[gpui::test]
     async fn test_expanding_a_restored_tool_call_group_does_not_materialize_terminals(
         cx: &mut TestAppContext,
     ) {

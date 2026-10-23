@@ -90,6 +90,21 @@ pub(crate) fn layout(input: LayoutInput) -> Vec<EntryPresentation> {
     presentation
 }
 
+pub(crate) fn header_entry_ix(
+    presentation: &[EntryPresentation],
+    mut entry_ix: usize,
+    first_entry_ix: usize,
+) -> usize {
+    while entry_ix > first_entry_ix
+        && presentation.get(entry_ix).is_some_and(|presentation| {
+            presentation.content == Content::Hidden && presentation.header.is_none()
+        })
+    {
+        entry_ix -= 1;
+    }
+    entry_ix
+}
+
 struct ToolCallRun {
     entries: Range<usize>,
     tool_call_count: usize,
@@ -390,6 +405,30 @@ mod tests {
             collapsed(&kinds, true),
             vec![group(0, 2, false), hidden(), full(), full()]
         );
+    }
+
+    #[test]
+    fn hidden_entries_lead_back_to_their_group_header() {
+        let presentation = collapsed(&[Answer, TOOL, Invisible, TOOL, TOOL, Answer], false);
+        assert_eq!(header_entry_ix(&presentation, 4, 0), 1);
+        assert_eq!(header_entry_ix(&presentation, 2, 0), 1);
+        assert_eq!(header_entry_ix(&presentation, 1, 0), 1);
+        assert_eq!(header_entry_ix(&presentation, 4, 3), 3);
+    }
+
+    #[test]
+    fn visible_entries_are_their_own_header_entry() {
+        let kinds = [Answer, TOOL, TOOL, TOOL, Answer];
+        let collapsed_group = collapsed(&kinds, false);
+        assert_eq!(header_entry_ix(&collapsed_group, 4, 0), 4);
+        assert_eq!(header_entry_ix(&collapsed_group, 0, 0), 0);
+
+        let expanded = HashSet::from_iter([CollapseKey::ToolCalls(tool_call_id(1))]);
+        let expanded_group = layout_of(&kinds, false, &expanded);
+        assert_eq!(header_entry_ix(&expanded_group, 3, 0), 3);
+
+        let collapsing_off = [];
+        assert_eq!(header_entry_ix(&collapsing_off, 3, 0), 3);
     }
 
     #[test]

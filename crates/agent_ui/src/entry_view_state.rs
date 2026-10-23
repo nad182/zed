@@ -24,7 +24,7 @@ use ui::{Context, TextSize};
 use workspace::Workspace;
 
 use crate::conversation_view::thread_collapse::{
-    CollapseKey, Content, EntryPresentation, LayoutInput, entry_kind, layout,
+    CollapseKey, Content, EntryPresentation, LayoutInput, entry_kind, header_entry_ix, layout,
 };
 use crate::message_editor::{MessageEditor, MessageEditorEvent, SharedSessionCapabilities};
 
@@ -130,6 +130,10 @@ impl EntryViewState {
 
     pub(crate) fn presentation(&self, entry_ix: usize) -> Option<&EntryPresentation> {
         self.presentation.get(entry_ix)
+    }
+
+    pub(crate) fn header_entry_ix(&self, entry_ix: usize, first_entry_ix: usize) -> usize {
+        header_entry_ix(&self.presentation, entry_ix, first_entry_ix)
     }
 
     pub(crate) fn is_entry_content_visible(&self, entry_ix: usize) -> bool {
