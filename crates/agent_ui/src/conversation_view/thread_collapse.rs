@@ -20,6 +20,7 @@ pub(crate) enum EntryKind {
     Thinking,
     ToolCall { groupable: bool, renders: bool },
     NeedsAction,
+    SessionMessage,
     Aside,
     Invisible,
 }
@@ -171,7 +172,7 @@ pub(crate) fn entry_kind(entry: &AgentThreadEntry, thread: &AcpThread, cx: &App)
             _ => EntryKind::Invisible,
         },
         AgentThreadEntry::ContextCompaction(_) => EntryKind::Aside,
-        AgentThreadEntry::SessionMessage(_) => EntryKind::Answer,
+        AgentThreadEntry::SessionMessage(_) => EntryKind::SessionMessage,
     }
 }
 
@@ -217,7 +218,9 @@ pub(super) fn tool_call_renders_nothing(tool_call: &ToolCall, cx: &App) -> bool 
 
 #[cfg(test)]
 mod tests {
-    use super::EntryKind::{Answer, Aside, Invisible, NeedsAction, Thinking, UserMessage};
+    use super::EntryKind::{
+        Answer, Aside, Invisible, NeedsAction, SessionMessage, Thinking, UserMessage,
+    };
     use super::*;
 
     const TOOL: EntryKind = EntryKind::ToolCall {
@@ -345,7 +348,15 @@ mod tests {
 
     #[test]
     fn diffs_and_other_visible_entries_end_runs() {
-        for barrier in [UserMessage, Answer, Thinking, DIFF, NeedsAction, Aside] {
+        for barrier in [
+            UserMessage,
+            Answer,
+            Thinking,
+            DIFF,
+            NeedsAction,
+            SessionMessage,
+            Aside,
+        ] {
             let kinds = [TOOL, barrier, TOOL];
             assert_eq!(collapsed(&kinds, false), vec![full(); 3], "{barrier:?}");
         }

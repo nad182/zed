@@ -13011,6 +13011,33 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_session_messages_end_tool_call_groups(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        apply_tool_call_updates(&thread, ["read-1", "read-2"].map(finished_read), cx);
+        thread
+            .update(cx, |thread, cx| {
+                thread.upsert_session_message(
+                    acp_v2::SessionMessage::new("hand-off")
+                        .recipient_session_id(acp_v2::SessionId::new("child"))
+                        .content(vec!["Investigate the failure".into()]),
+                    cx,
+                )
+            })
+            .expect("session message should apply");
+        apply_tool_call_updates(&thread, ["read-3", "read-4"].map(finished_read), cx);
+
+        assert_eq!(
+            tool_call_group_layout(&thread_view, cx),
+            (vec![(0, 2, false), (3, 2, false)], vec![0, 1, 3, 4])
+        );
+    }
+
+    #[gpui::test]
     async fn test_awaiting_authorization_searches_visible_patch_content(cx: &mut TestAppContext) {
         use agent_client_protocol::schema::v2 as acp_v2;
 
