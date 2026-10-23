@@ -14036,6 +14036,54 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_subagent_threads_keep_their_turns_expanded(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let root =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root.read_with(cx, |thread, _| thread.session_id().clone());
+        let child = conversation_view.update(cx, |view, cx| {
+            create_test_acp_thread(
+                Some(root_session_id),
+                "child",
+                Rc::new(connection.clone()),
+                view.project.clone(),
+                cx,
+            )
+        });
+        root.update(cx, |root, cx| root.register_subagent(child.clone(), cx));
+        cx.run_until_parked();
+
+        child.update(cx, |child, cx| {
+            child.push_user_content_block(None, "Investigate".into(), cx);
+        });
+        apply_tool_call_updates(
+            &child,
+            [finished_read("read-1"), finished_read("read-2")],
+            cx,
+        );
+        child.update(cx, |child, cx| {
+            child
+                .handle_session_update(message_update("Done."), cx)
+                .expect("message update");
+        });
+        cx.run_until_parked();
+
+        let child_view = conversation_view.read_with(cx, |view, cx| {
+            view.thread_view(child.read(cx).session_id())
+                .expect("the child should have a view")
+        });
+        assert_eq!(turn_summaries(&child_view, cx), vec![]);
+        assert_eq!(
+            tool_call_group_layout(&child_view, cx),
+            (vec![(1, 2, false)], vec![1, 2])
+        );
+    }
+
+    #[gpui::test]
     async fn test_request_elicitations_recompute_turn_presentation(cx: &mut TestAppContext) {
         init_test(cx);
         cx.update(|cx| set_collapse_finished_turns(true, cx));

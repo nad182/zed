@@ -97,6 +97,7 @@ pub(crate) struct LayoutInput<'a> {
     pub kinds: &'a [EntryKind],
     pub tool_call_ids: &'a [Option<acp_v2::ToolCallId>],
     pub tail_is_growing: bool,
+    pub collapse_turns: bool,
     pub last_turn_is_live: bool,
     pub turn_records: &'a HashMap<usize, TurnRecord>,
     pub expanded: &'a HashSet<CollapseKey>,
@@ -104,7 +105,11 @@ pub(crate) struct LayoutInput<'a> {
 
 pub(crate) fn layout(input: LayoutInput) -> Vec<EntryPresentation> {
     let mut presentation = vec![EntryPresentation::default(); input.kinds.len()];
-    for turn in collapsible_turns(input.kinds, input.last_turn_is_live) {
+    let turns = input
+        .collapse_turns
+        .then(|| collapsible_turns(input.kinds, input.last_turn_is_live))
+        .unwrap_or_default();
+    for turn in turns {
         let record = input.turn_records.get(&turn.user_message_ix);
         if record.is_some_and(|record| record.outcome == TurnOutcome::Interrupted) {
             continue;
@@ -408,6 +413,7 @@ mod tests {
 
     struct Scenario<'a> {
         kinds: &'a [EntryKind],
+        collapse_turns: bool,
         last_turn_is_live: bool,
         turn_records: HashMap<usize, TurnRecord>,
         expanded: HashSet<CollapseKey>,
@@ -417,6 +423,7 @@ mod tests {
         fn new(kinds: &'a [EntryKind]) -> Self {
             Self {
                 kinds,
+                collapse_turns: true,
                 last_turn_is_live: false,
                 turn_records: HashMap::default(),
                 expanded: HashSet::default(),
@@ -457,6 +464,7 @@ mod tests {
                 kinds: self.kinds,
                 tool_call_ids: &tool_call_ids,
                 tail_is_growing: self.last_turn_is_live,
+                collapse_turns: self.collapse_turns,
                 last_turn_is_live: self.last_turn_is_live,
                 turn_records: &self.turn_records,
                 expanded: &self.expanded,
@@ -761,6 +769,17 @@ mod tests {
                 group(8, 2, false),
                 hidden(),
             ]
+        );
+    }
+
+    #[test]
+    fn turns_stay_expanded_when_turn_collapsing_is_off() {
+        let kinds = [UserMessage, TOOL, TOOL, TEXT];
+        let mut scenario = Scenario::new(&kinds);
+        scenario.collapse_turns = false;
+        assert_eq!(
+            scenario.layout(),
+            vec![full(), group(1, 2, false), hidden(), full()]
         );
     }
 
