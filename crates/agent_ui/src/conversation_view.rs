@@ -1968,6 +1968,7 @@ impl ConversationView {
             AcpThreadEvent::StatusChanged => {
                 if let Some(active) = self.thread_view(&session_id) {
                     active.update(cx, |active, cx| {
+                        active.sync_reported_turn(cx);
                         active.sync_reported_activity(cx);
                         active.sync_generating_indicator(cx);
                         active.sync_presentation(cx);
@@ -13218,6 +13219,147 @@ pub(crate) mod tests {
 
         run_activity(None, cx);
         assert_eq!(turn_record(&thread_view, 0, cx), Some(record));
+    }
+
+    async fn reported_activity_thread(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<ConversationView>,
+        Entity<ThreadView>,
+        Entity<AcpThread>,
+        &mut VisualTestContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let connection = StubAgentConnection::new().with_receipt_submissions(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        (conversation_view, thread_view, thread, cx)
+    }
+
+    fn report_state(
+        thread: &Entity<AcpThread>,
+        state: serde_json::Value,
+        cx: &mut VisualTestContext,
+    ) {
+        let state: acp_v2::StateUpdate =
+            serde_json::from_value(state).expect("state update should deserialize");
+        thread.update(cx, |thread, cx| {
+            thread
+                .update_session_state(state, cx)
+                .expect("state update should apply")
+        });
+        cx.run_until_parked();
+    }
+
+    fn run_reported_prompt(thread: &Entity<AcpThread>, prompt: &str, cx: &mut VisualTestContext) {
+        report_state(thread, json!({"state": "running"}), cx);
+        thread.update(cx, |thread, cx| {
+            thread
+                .upsert_user_message(
+                    acp_v2::UserMessage::new(prompt.to_string()).content(vec![prompt.into()]),
+                    cx,
+                )
+                .expect("user message echo");
+        });
+        cx.run_until_parked();
+        apply_tool_call_updates(thread, [finished_read(&format!("read-{prompt}"))], cx);
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(message_update("Done."), cx)
+                .expect("message update");
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_reported_idle_with_usage_keeps_stop_reason(cx: &mut TestAppContext) {
+        for (stop_reason, expected) in [
+            ("cancelled", turn_lifecycle::TurnOutcome::Interrupted),
+            ("max_tokens", turn_lifecycle::TurnOutcome::Interrupted),
+            ("refusal", turn_lifecycle::TurnOutcome::Interrupted),
+            ("end_turn", turn_lifecycle::TurnOutcome::Finished),
+        ] {
+            let (_conversation_view, thread_view, thread, cx) = reported_activity_thread(cx).await;
+            run_reported_prompt(&thread, "Prompt", cx);
+            report_state(
+                &thread,
+                json!({
+                    "state": "idle", "stopReason": stop_reason,
+                    "usage": {"totalTokens": 12, "inputTokens": 5, "outputTokens": 7}
+                }),
+                cx,
+            );
+
+            let record = turn_record(&thread_view, 0, cx).expect("the prompt should own its turn");
+            assert_eq!(record.outcome, expected, "{stop_reason}");
+            assert_eq!(
+                record.duration,
+                thread.read_with(cx, |thread, _| thread.activity_duration()),
+                "{stop_reason}"
+            );
+            let expected_summaries = match expected {
+                turn_lifecycle::TurnOutcome::Finished => vec![(1, record.duration, false)],
+                _ => vec![],
+            };
+            assert_eq!(
+                turn_summaries(&thread_view, cx),
+                expected_summaries,
+                "{stop_reason}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_unconfirmed_gap_keeps_live_reported_turn(cx: &mut TestAppContext) {
+        let (_conversation_view, thread_view, thread, cx) = reported_activity_thread(cx).await;
+        run_reported_prompt(&thread, "Prompt", cx);
+        thread.update(cx, |thread, cx| {
+            thread
+                .clear_session_state(cx)
+                .expect("reported state should clear")
+        });
+        cx.run_until_parked();
+        report_state(&thread, json!({"state": "running"}), cx);
+        thread_view.read_with(cx, |view, _| {
+            assert!(view.turn_fields.turn_lifecycle.is_live());
+        });
+        assert_eq!(turn_record(&thread_view, 0, cx), None);
+
+        report_state(
+            &thread,
+            json!({"state": "idle", "stopReason": "end_turn"}),
+            cx,
+        );
+        let record = turn_record(&thread_view, 0, cx).expect("the prompt should own its turn");
+        assert_eq!(record.outcome, turn_lifecycle::TurnOutcome::Finished);
+        assert_eq!(
+            turn_summaries(&thread_view, cx),
+            vec![(1, record.duration, false)]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_unknown_activity_does_not_start_a_turn(cx: &mut TestAppContext) {
+        let (_conversation_view, thread_view, thread, cx) = reported_activity_thread(cx).await;
+        thread.update(cx, |thread, cx| {
+            thread
+                .upsert_user_message(
+                    acp_v2::UserMessage::new("restored").content(vec!["Restored".into()]),
+                    cx,
+                )
+                .expect("restored user message");
+        });
+        cx.run_until_parked();
+
+        report_state(&thread, json!({"state": "unknown"}), cx);
+        thread_view.read_with(cx, |view, _| {
+            assert!(!view.turn_fields.turn_lifecycle.is_live());
+        });
+        report_state(&thread, json!({"state": "idle"}), cx);
+        assert_eq!(turn_record(&thread_view, 0, cx), None);
     }
 
     #[gpui::test]

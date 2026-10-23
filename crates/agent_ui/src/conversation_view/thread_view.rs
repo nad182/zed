@@ -1348,6 +1348,7 @@ impl ThreadView {
         };
 
         this.turn_fields.turn_lifecycle = TurnLifecycle::new(this.last_user_message_ix(cx));
+        this.sync_reported_turn(cx);
         this.sync_reported_activity(cx);
         this.sync_generating_indicator(cx);
         this.sync_editor_mode(cx);
@@ -1766,7 +1767,33 @@ impl ThreadView {
             .map(|started| started.elapsed());
         self.turn_fields.last_turn_tokens = self.turn_fields.turn_tokens.take();
         self.turn_fields._turn_timer_task = None;
-        self.record_turn(self.turn_fields.last_turn_duration, cx);
+        if !self.thread.read(cx).uses_reported_activity() {
+            self.record_turn(self.turn_fields.last_turn_duration, cx);
+        }
+    }
+
+    pub(crate) fn sync_reported_turn(&mut self, cx: &mut Context<Self>) {
+        let thread = self.thread.read(cx);
+        if !thread.uses_reported_activity() {
+            return;
+        }
+        match thread.foreground_activity() {
+            ForegroundActivity::Running | ForegroundActivity::RequiresAction => {
+                let activity_generation = thread.activity_generation();
+                let last_user_message_ix = self.last_user_message_ix(cx);
+                let previous_turn = self.turn_fields.turn_lifecycle.start_reported(
+                    activity_generation,
+                    last_user_message_ix,
+                    self.turn_elapsed(),
+                );
+                self.apply_turn_record(previous_turn, cx);
+            }
+            ForegroundActivity::Idle => {
+                let activity_duration = thread.activity_duration();
+                self.record_turn(activity_duration, cx);
+            }
+            ForegroundActivity::Unconfirmed | ForegroundActivity::Unknown => {}
+        }
     }
 
     pub(crate) fn finish_turn(

@@ -51,6 +51,7 @@ pub(crate) struct TurnLifecycle {
     outcome: Option<TurnOutcome>,
     reported_duration: Option<Duration>,
     last_recorded_owner: TurnOwner,
+    reported_activity_generation: Option<u64>,
 }
 
 impl TurnLifecycle {
@@ -81,9 +82,14 @@ impl TurnLifecycle {
 
     pub(crate) fn start_reported(
         &mut self,
+        activity_generation: u64,
         last_user_message_ix: Option<usize>,
         previous_elapsed: Option<Duration>,
     ) -> Option<(usize, TurnRecord)> {
+        if self.reported_activity_generation == Some(activity_generation) {
+            return None;
+        }
+        self.reported_activity_generation = Some(activity_generation);
         let unowned_user_message_ix = last_user_message_ix.filter(|&user_message_ix| {
             self.newest_owned_user_message_ix
                 .is_none_or(|newest| user_message_ix > newest)
@@ -118,6 +124,9 @@ impl TurnLifecycle {
     }
 
     pub(crate) fn record(&mut self, elapsed: Option<Duration>) -> Option<(usize, TurnRecord)> {
+        if !self.in_flight {
+            return None;
+        }
         self.in_flight = false;
         let outcome = self.outcome.take().unwrap_or(TurnOutcome::Unknown);
         let reported_duration = self.reported_duration.take();
@@ -212,7 +221,7 @@ mod tests {
     #[test]
     fn native_commands_and_restored_prompts_are_never_claimed() {
         let mut lifecycle = TurnLifecycle::new(Some(0));
-        lifecycle.start_reported(Some(0), None);
+        lifecycle.start_reported(1, Some(0), None);
         assert_eq!(owner_ix(lifecycle.record(None)), None);
 
         lifecycle.start(TurnOwner::NextUserMessage, None);
@@ -223,13 +232,28 @@ mod tests {
         lifecycle.user_message_pushed(6);
         assert_eq!(owner_ix(lifecycle.record(None)), None);
 
-        lifecycle.start_reported(Some(3), None);
+        lifecycle.start_reported(2, Some(3), None);
         assert!(!lifecycle.is_live());
         lifecycle.user_message_pushed(8);
         assert_eq!(owner_ix(lifecycle.record(None)), Some(8));
 
-        lifecycle.start_reported(Some(10), None);
+        lifecycle.start_reported(3, Some(10), None);
         assert_eq!(owner_ix(lifecycle.record(None)), Some(10));
+    }
+
+    #[test]
+    fn reported_activity_starts_one_turn_per_generation() {
+        let mut lifecycle = TurnLifecycle::default();
+        assert_eq!(lifecycle.start_reported(1, Some(0), None), None);
+        lifecycle.finish(Some(&StopReason::EndTurn), None);
+        assert_eq!(lifecycle.start_reported(1, Some(2), None), None);
+        assert_eq!(outcome(lifecycle.record(None)), Some(TurnOutcome::Finished));
+        assert_eq!(lifecycle.retry_owner(), TurnOwner::UserMessage(0));
+
+        assert_eq!(lifecycle.record(None), None);
+        assert_eq!(lifecycle.retry_owner(), TurnOwner::UserMessage(0));
+        lifecycle.start_reported(1, Some(2), None);
+        assert!(!lifecycle.is_live());
     }
 
     #[test]
@@ -238,7 +262,7 @@ mod tests {
         lifecycle.start(TurnOwner::UserMessage(4), None);
         lifecycle.remove(&(4..6));
         assert_eq!(owner_ix(lifecycle.record(None)), None);
-        lifecycle.start_reported(Some(3), None);
+        lifecycle.start_reported(1, Some(3), None);
         assert_eq!(owner_ix(lifecycle.record(None)), None);
 
         lifecycle.start(TurnOwner::UserMessage(6), None);
