@@ -13099,6 +13099,83 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_expanding_a_restored_tool_call_group_does_not_materialize_terminals(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        let conversation = active_thread(&conversation_view, cx)
+            .read_with(cx, |view, _| view.conversation.clone());
+        let thread = conversation_view.update(cx, |view, cx| {
+            create_test_acp_thread(
+                None,
+                "restored-group",
+                Rc::new(StubAgentConnection::new()),
+                view.project.clone(),
+                cx,
+            )
+        });
+        for tool_call_id in ["run-1", "run-2"] {
+            thread
+                .update(cx, |thread, cx| {
+                    thread.upsert_wire_tool_call(
+                        acp_v2::ToolCallUpdate::new(tool_call_id)
+                            .title("Run command")
+                            .kind(acp_v2::ToolKind::Execute)
+                            .status(acp_v2::ToolCallStatus::Completed)
+                            .content(vec![acp_v2::ToolCallContent::Terminal(
+                                acp_v2::Terminal::new(tool_call_id),
+                            )]),
+                        cx,
+                    )
+                })
+                .expect("terminal tool call should apply");
+        }
+        let thread_view = conversation_view.update_in(cx, |view, window, cx| {
+            conversation.update(cx, |conversation, cx| {
+                conversation.register_thread(thread.clone(), cx);
+            });
+            view.new_thread_view(thread, conversation, false, None, window, cx)
+        });
+        assert_eq!(
+            tool_call_group_layout(&thread_view, cx),
+            (vec![(0, 2, false)], vec![0, 1])
+        );
+
+        thread_view.update(cx, |view, cx| {
+            view.toggle_collapse(
+                thread_collapse::CollapseKey::ToolCalls(acp_v2::ToolCallId::new("run-1")),
+                cx,
+            );
+        });
+        draw_restored_thread(&thread_view, cx);
+        cx.run_until_parked();
+
+        assert_eq!(
+            tool_call_group_layout(&thread_view, cx),
+            (vec![(0, 2, true)], vec![])
+        );
+        thread_view.read_with(cx, |view, cx| {
+            let entry_view_state = view.entry_view_state.read(cx);
+            for entry_ix in 0..2 {
+                assert_eq!(
+                    view.thread.read(cx).entries()[entry_ix].terminals().count(),
+                    1
+                );
+                assert!(
+                    !entry_view_state
+                        .entry(entry_ix)
+                        .expect("tool call entry")
+                        .has_content(),
+                    "entry {entry_ix}"
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
     async fn test_awaiting_authorization_searches_visible_patch_content(cx: &mut TestAppContext) {
         use agent_client_protocol::schema::v2 as acp_v2;
 
