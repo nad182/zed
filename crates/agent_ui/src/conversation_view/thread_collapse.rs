@@ -194,9 +194,12 @@ fn collapsible_turn(
     let final_answer_offset = body_kinds
         .iter()
         .rposition(|kind| matches!(kind, EntryKind::Answer { .. }))?;
-    let ends_on_answer = body_kinds[final_answer_offset + 1..]
-        .iter()
-        .all(|kind| matches!(kind, EntryKind::Aside | EntryKind::Invisible));
+    let ends_on_answer = body_kinds[final_answer_offset + 1..].iter().all(|kind| {
+        matches!(
+            kind,
+            EntryKind::SessionMessage | EntryKind::Aside | EntryKind::Invisible
+        )
+    });
     if !ends_on_answer {
         return None;
     }
@@ -665,6 +668,29 @@ mod tests {
                 with_headers(Content::Hidden, vec![turn_header(0, 4, false)]),
                 hidden(),
                 hidden(),
+                hidden(),
+                hidden(),
+                answer_without_thoughts(),
+                full(),
+            ]
+        );
+    }
+
+    #[test]
+    fn session_messages_fold_into_finished_turns() {
+        let kinds = [
+            UserMessage,
+            SessionMessage,
+            TOOL,
+            TOOL,
+            TEXT,
+            SessionMessage,
+        ];
+        assert_eq!(
+            Scenario::new(&kinds).layout(),
+            vec![
+                full(),
+                with_headers(Content::Hidden, vec![turn_header(0, 2, false)]),
                 hidden(),
                 hidden(),
                 answer_without_thoughts(),
