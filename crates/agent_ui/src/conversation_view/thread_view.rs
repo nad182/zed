@@ -7911,14 +7911,8 @@ impl ThreadView {
             .unwrap_or(!is_generating);
 
         let primary = if is_turn_end && !assistant_message_is_blank {
-            let user_message_index = {
-                let thread = thread.read(cx);
-                thread
-                    .entries()
-                    .iter()
-                    .take(entry_ix)
-                    .rposition(|entry| thread.is_user_authored_scroll_target(entry))
-            };
+            let user_message_index =
+                (0..entry_ix).rfind(|&ix| self.is_visible_user_authored_entry(ix, cx));
 
             v_flex()
                 .w_full()
@@ -8391,11 +8385,9 @@ impl ThreadView {
 
         // Scroll to the provided user message, or fall back to the most recent one.
         // (Fallback: if no user message exists, scroll to the bottom.)
-        if let Some(ix) = user_message_index.or_else(|| {
-            entries
-                .iter()
-                .rposition(|entry| thread.is_user_authored_scroll_target(entry))
-        }) {
+        if let Some(ix) = user_message_index
+            .or_else(|| (0..entries.len()).rfind(|&ix| self.is_visible_user_authored_entry(ix, cx)))
+        {
             self.list_state.scroll_to(ListOffset {
                 item_ix: ix,
                 offset_in_item: px(0.0),
@@ -8404,6 +8396,18 @@ impl ThreadView {
         } else {
             self.scroll_to_end(cx);
         }
+    }
+
+    fn is_visible_user_authored_entry(&self, entry_ix: usize, cx: &App) -> bool {
+        let thread = self.thread.read(cx);
+        thread
+            .entries()
+            .get(entry_ix)
+            .is_some_and(|entry| thread.is_user_authored_scroll_target(entry))
+            && self
+                .entry_view_state
+                .read(cx)
+                .is_entry_content_visible(entry_ix)
     }
 
     pub fn scroll_to_end(&mut self, cx: &mut Context<Self>) {
@@ -8499,14 +8503,10 @@ impl ThreadView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let thread = self.thread.read(cx);
-        let entries = thread.entries();
         let current_ix = self.list_state.logical_scroll_top().item_ix;
-        if let Some(target_ix) = (0..current_ix).rev().find(|&i| {
-            entries
-                .get(i)
-                .is_some_and(|entry| thread.is_user_authored_scroll_target(entry))
-        }) {
+        if let Some(target_ix) =
+            (0..current_ix).rfind(|&ix| self.is_visible_user_authored_entry(ix, cx))
+        {
             self.list_state.scroll_to(ListOffset {
                 item_ix: target_ix,
                 offset_in_item: px(0.),
@@ -8521,14 +8521,11 @@ impl ThreadView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let thread = self.thread.read(cx);
-        let entries = thread.entries();
+        let entry_count = self.thread.read(cx).entries().len();
         let current_ix = self.list_state.logical_scroll_top().item_ix;
-        if let Some(target_ix) = (current_ix + 1..entries.len()).find(|&i| {
-            entries
-                .get(i)
-                .is_some_and(|entry| thread.is_user_authored_scroll_target(entry))
-        }) {
+        if let Some(target_ix) =
+            (current_ix + 1..entry_count).find(|&ix| self.is_visible_user_authored_entry(ix, cx))
+        {
             self.list_state.scroll_to(ListOffset {
                 item_ix: target_ix,
                 offset_in_item: px(0.),

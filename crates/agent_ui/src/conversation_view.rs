@@ -14128,6 +14128,125 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_message_navigation_skips_answers_hidden_in_collapsed_turns(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![
+            finished_read_update("read-1", "Read file"),
+            acp_v1::SessionUpdate::ToolCall(
+                acp_v1::ToolCall::new("ask-user-1", "Which directory should we explore?")
+                    .kind(acp_v1::ToolKind::Other)
+                    .status(acp_v1::ToolCallStatus::Completed)
+                    .meta(acp_thread::meta_with_tool_name("ask_user")),
+            ),
+        ]);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Prompt", cx))
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let response_task = thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation(
+                    acp_v2::CreateElicitationRequest::new(
+                        acp_v2::ElicitationFormMode::new(
+                            acp_v2::ElicitationSessionScope::new(session_id)
+                                .tool_call_id(acp_v2::ToolCallId::new("ask-user-1")),
+                            acp_v2::ElicitationSchema::new().string("other", true),
+                        ),
+                        "Which directory should we explore?",
+                    ),
+                    cx,
+                )
+                .expect("ask_user elicitation should be accepted")
+        });
+        let elicitation_id = thread
+            .read_with(cx, |thread, _| {
+                thread.entries().iter().find_map(|entry| match entry {
+                    AgentThreadEntry::Elicitation(id) => Some(id.clone()),
+                    _ => None,
+                })
+            })
+            .expect("elicitation entry should exist");
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_elicitation(
+                &elicitation_id,
+                acp_v2::CreateElicitationResponse::new(acp_v2::ElicitationAction::Accept(
+                    acp_v2::ElicitationAcceptAction::new().content(
+                        std::collections::BTreeMap::from([(
+                            "other".to_string(),
+                            acp_v2::ElicitationContentValue::from("delve into src"),
+                        )]),
+                    ),
+                )),
+                cx,
+            );
+        });
+        response_task.await;
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(message_update("Done."), cx)
+                .expect("message update");
+        });
+        cx.run_until_parked();
+        assert_eq!(turn_summaries(&thread_view, cx), vec![(1, None, false)]);
+
+        fn navigate(
+            thread_view: &Entity<ThreadView>,
+            from_ix: usize,
+            action: impl Action,
+            cx: &mut VisualTestContext,
+        ) -> usize {
+            thread_view.update_in(cx, |view, window, cx| {
+                view.list_state.scroll_to(ListOffset {
+                    item_ix: from_ix,
+                    offset_in_item: px(0.),
+                });
+                view.focus_handle(cx).focus(window, cx);
+            });
+            cx.dispatch_action(action);
+            cx.run_until_parked();
+            thread_view.read_with(cx, |view, _| view.list_state.logical_scroll_top().item_ix)
+        }
+        let scroll_to_latest_user_message = |cx: &mut VisualTestContext| {
+            thread_view.update(cx, |view, cx| {
+                view.scroll_to_user_message_index(None, cx);
+                view.list_state.logical_scroll_top().item_ix
+            })
+        };
+        assert_eq!(
+            navigate(&thread_view, 4, ScrollOutputToPreviousMessage, cx),
+            0
+        );
+        assert_eq!(navigate(&thread_view, 0, ScrollOutputToNextMessage, cx), 0);
+        assert_eq!(scroll_to_latest_user_message(cx), 0);
+
+        thread_view.update(cx, |view, cx| {
+            view.toggle_collapse(thread_collapse::CollapseKey::Turn(0), cx);
+            view.toggle_collapse(
+                thread_collapse::CollapseKey::ToolCalls(acp_v2::ToolCallId::new("read-1")),
+                cx,
+            );
+        });
+        assert_eq!(
+            navigate(&thread_view, 4, ScrollOutputToPreviousMessage, cx),
+            2
+        );
+        assert_eq!(navigate(&thread_view, 0, ScrollOutputToNextMessage, cx), 2);
+        assert_eq!(scroll_to_latest_user_message(cx), 2);
+    }
+
+    #[gpui::test]
     async fn test_request_elicitations_recompute_turn_presentation(cx: &mut TestAppContext) {
         init_test(cx);
         cx.update(|cx| set_collapse_finished_turns(true, cx));
