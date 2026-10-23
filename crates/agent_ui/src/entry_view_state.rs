@@ -718,7 +718,7 @@ impl EntryViewState {
             kinds: &kinds,
             tool_call_ids: &tool_call_ids,
             tail_is_growing: matches!(thread.status(), ThreadStatus::Generating),
-            // Subagent card previews show only the last entries, which can cut off a summary row.
+            // Subagent cards preview the child's latest entries, which would show only its answer.
             collapse_turns: thread.parent_session_id().is_none(),
             last_turn_is_live: thread.status() != ThreadStatus::Idle || last_turn_is_live_hint,
             turn_records: &self.turn_records,
