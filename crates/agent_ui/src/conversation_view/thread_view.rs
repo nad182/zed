@@ -12537,7 +12537,10 @@ impl ThreadView {
         let entries = subagent_view.thread.read(cx).entries();
         let total_entries = entries.len();
         let entry_range = state.preview_range(total_entries, MAX_PREVIEW_ENTRIES);
-        let start_ix = entry_range.start;
+        let start_ix = subagent_view.entry_view_state.read(cx).header_entry_ix(
+            entry_range.start,
+            state.entries.map_or(0, |entries| entries.start),
+        );
 
         let scroll_handle = self
             .subagent_scroll_handles
@@ -12549,7 +12552,7 @@ impl ThreadView {
         scroll_handle.scroll_to_bottom();
 
         let rendered_entries: Vec<AnyElement> = entries
-            .get(entry_range)
+            .get(start_ix..entry_range.end)
             .unwrap_or_default()
             .iter()
             .enumerate()

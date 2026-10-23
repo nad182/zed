@@ -157,6 +157,21 @@ pub(crate) fn layout(input: LayoutInput) -> Vec<EntryPresentation> {
     presentation
 }
 
+pub(crate) fn header_entry_ix(
+    presentation: &[EntryPresentation],
+    mut entry_ix: usize,
+    first_entry_ix: usize,
+) -> usize {
+    while entry_ix > first_entry_ix
+        && presentation.get(entry_ix).is_some_and(|presentation| {
+            presentation.content == Content::Hidden && presentation.headers.is_empty()
+        })
+    {
+        entry_ix -= 1;
+    }
+    entry_ix
+}
+
 struct CollapsibleTurn {
     user_message_ix: usize,
     work: Range<usize>,
@@ -329,7 +344,8 @@ pub(crate) fn entry_kind(entry: &AgentThreadEntry, thread: &AcpThread, cx: &App)
             EntryKind::NeedsAction
         }
         AgentThreadEntry::ToolCall(tool_call) => EntryKind::ToolCall {
-            groupable: tool_call_is_groupable(tool_call),
+            groupable: tool_call_is_groupable(tool_call)
+                && !thread.is_user_authored_scroll_target(entry),
             renders: !tool_call_renders_nothing(tool_call, cx),
         },
         AgentThreadEntry::Elicitation(elicitation_id) => match thread.elicitation(elicitation_id) {
@@ -647,6 +663,30 @@ mod tests {
             collapsed(&kinds, true),
             vec![group(0, 2, false), hidden(), full(), full()]
         );
+    }
+
+    #[test]
+    fn hidden_entries_lead_back_to_their_group_header() {
+        let presentation = collapsed(&[TEXT, TOOL, Invisible, TOOL, TOOL, TEXT], false);
+        assert_eq!(header_entry_ix(&presentation, 4, 0), 1);
+        assert_eq!(header_entry_ix(&presentation, 2, 0), 1);
+        assert_eq!(header_entry_ix(&presentation, 1, 0), 1);
+        assert_eq!(header_entry_ix(&presentation, 4, 3), 3);
+    }
+
+    #[test]
+    fn visible_entries_are_their_own_header_entry() {
+        let kinds = [TEXT, TOOL, TOOL, TOOL, TEXT];
+        let collapsed_group = collapsed(&kinds, false);
+        assert_eq!(header_entry_ix(&collapsed_group, 4, 0), 4);
+        assert_eq!(header_entry_ix(&collapsed_group, 0, 0), 0);
+
+        let expanded = HashSet::from_iter([CollapseKey::ToolCalls(tool_call_id(1))]);
+        let expanded_group = layout_of(&kinds, false, &expanded);
+        assert_eq!(header_entry_ix(&expanded_group, 3, 0), 3);
+
+        let collapsing_off = [];
+        assert_eq!(header_entry_ix(&collapsing_off, 3, 0), 3);
     }
 
     #[test]

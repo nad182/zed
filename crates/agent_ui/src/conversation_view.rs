@@ -14674,6 +14674,145 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_answered_questions_end_tool_call_groups(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        apply_tool_call_updates(
+            &thread,
+            [
+                finished_read("read-1"),
+                finished_read("read-2"),
+                json!({"toolCallId": "ask", "title": "Which directory?", "kind": "other", "status": "in_progress"}),
+            ],
+            cx,
+        );
+
+        let response_task = thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation(
+                    acp_v2::CreateElicitationRequest::new(
+                        acp_v2::ElicitationFormMode::new(
+                            acp_v2::ElicitationSessionScope::new(session_id)
+                                .tool_call_id(acp_v2::ToolCallId::new("ask")),
+                            acp_v2::ElicitationSchema::new().string("other", true),
+                        ),
+                        "Which directory?",
+                    ),
+                    cx,
+                )
+                .expect("the question should be accepted")
+        });
+        let elicitation_id = thread
+            .read_with(cx, |thread, _| {
+                thread.entries().iter().find_map(|entry| match entry {
+                    AgentThreadEntry::Elicitation(id) => Some(id.clone()),
+                    _ => None,
+                })
+            })
+            .expect("the question should have an entry");
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_elicitation(
+                &elicitation_id,
+                acp_v2::CreateElicitationResponse::new(acp_v2::ElicitationAction::Accept(
+                    acp_v2::ElicitationAcceptAction::new().content(
+                        std::collections::BTreeMap::from([(
+                            "other".to_string(),
+                            acp_v2::ElicitationContentValue::from("src"),
+                        )]),
+                    ),
+                )),
+                cx,
+            );
+        });
+        response_task.await;
+        apply_tool_call_updates(
+            &thread,
+            [
+                json!({"toolCallId": "ask", "status": "completed"}),
+                finished_read("read-3"),
+                finished_read("read-4"),
+            ],
+            cx,
+        );
+
+        assert_eq!(
+            tool_call_group_layout(&thread_view, cx),
+            (vec![(0, 2, false), (4, 2, false)], vec![0, 1, 4, 5])
+        );
+    }
+
+    #[gpui::test]
+    async fn test_subagent_preview_starting_inside_a_group_shows_the_group_row(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let root_view = active_thread(&conversation_view, cx);
+        let root = root_view.read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root.read_with(cx, |thread, _| thread.session_id().clone());
+        let child = conversation_view.update(cx, |view, cx| {
+            create_test_acp_thread(
+                Some(root_session_id),
+                "child",
+                Rc::new(connection.clone()),
+                view.project.clone(),
+                cx,
+            )
+        });
+        root.update(cx, |root, cx| root.register_subagent(child.clone(), cx));
+        cx.run_until_parked();
+
+        child.update(cx, |child, cx| {
+            child.push_user_content_block(None, "Investigate".into(), cx);
+        });
+        apply_tool_call_updates(
+            &child,
+            (1..=10).map(|n| finished_read(&format!("read-{n}"))),
+            cx,
+        );
+        let child_view = conversation_view.read_with(cx, |view, cx| {
+            view.thread_view(child.read(cx).session_id())
+                .expect("the child should have a view")
+        });
+        assert_eq!(
+            tool_call_group_layout(&child_view, cx),
+            (vec![(1, 10, false)], (1..=10).collect())
+        );
+
+        apply_tool_call_updates(
+            &root,
+            [json!({
+                "toolCallId": "spawn",
+                "title": "Investigate",
+                "status": "completed",
+                "_meta": {acp_thread::SUBAGENT_SESSION_INFO_META_KEY: {
+                    "session_id": "child",
+                    "message_start_index": 0,
+                }},
+            })],
+            cx,
+        );
+        root_view.update(cx, |view, cx| {
+            view.entry_view_state.update(cx, |state, _| {
+                state.expand_tool_call(acp_v2::ToolCallId::new("spawn"));
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("tool-call-group-1").is_some());
+    }
+
+    #[gpui::test]
     async fn test_expanding_a_restored_tool_call_group_does_not_materialize_terminals(
         cx: &mut TestAppContext,
     ) {
