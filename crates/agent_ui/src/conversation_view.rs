@@ -14084,6 +14084,50 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_pending_permission_request_keeps_its_turn_expanded(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.push_user_content_block(None, "Prompt".into(), cx);
+        });
+        apply_tool_call_updates(&thread, ["read-1", "asks"].map(finished_read), cx);
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(message_update("Done."), cx)
+                .expect("message update");
+        });
+        cx.run_until_parked();
+        assert_eq!(turn_summaries(&thread_view, cx), vec![(1, None, false)]);
+
+        let request = generic_permission_prompt(
+            &thread,
+            Some(json!({"type": "tool_call", "toolCall": {"toolCallId": "asks"}})),
+            cx,
+        );
+        let (request_id, response) = request_test_generic_permission(&thread, request, cx);
+        cx.run_until_parked();
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Idle
+        );
+        assert_eq!(turn_summaries(&thread_view, cx), vec![]);
+
+        click_generic_permission(request_id, Some("once"), cx);
+        assert_eq!(
+            response.await,
+            acp_v2::RequestPermissionOutcome::Selected(acp_v2::SelectedPermissionOutcome::new(
+                "once"
+            ))
+        );
+        assert_eq!(turn_summaries(&thread_view, cx), vec![(1, None, false)]);
+    }
+
+    #[gpui::test]
     async fn test_request_elicitations_recompute_turn_presentation(cx: &mut TestAppContext) {
         init_test(cx);
         cx.update(|cx| set_collapse_finished_turns(true, cx));
