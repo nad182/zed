@@ -57,7 +57,8 @@ use super::elicitation::{
 };
 use super::subagent_card::{SubagentCardState, SubagentStatus};
 use super::thread_collapse::{
-    CollapseKey, Content, Header, has_pending_request_elicitation, tool_call_renders_nothing,
+    CollapseKey, Content, Header, connection_has_pending_request_elicitation,
+    tool_call_renders_nothing,
 };
 use super::turn_lifecycle::{TurnLifecycle, TurnOwner, TurnRecord};
 use super::*;
@@ -3512,6 +3513,20 @@ impl ThreadView {
         }
         cx.notify();
         Some(())
+    }
+
+    fn has_pending_request_elicitation(&self, cx: &App) -> bool {
+        self.server_view
+            .read_with(cx, |server_view, cx| {
+                server_view
+                    .request_elicitation_store()
+                    .is_some_and(|store| {
+                        store.read(cx).elicitations().iter().any(|elicitation| {
+                            matches!(elicitation.status, ElicitationStatus::Pending { .. })
+                        })
+                    })
+            })
+            .unwrap_or(false)
     }
 
     pub fn sync_elicitation_state_for_entry(
@@ -7307,10 +7322,11 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
 impl ThreadView {
     pub(crate) fn sync_presentation(&mut self, cx: &mut Context<Self>) {
         let thread = self.thread.clone();
-        // An owned turn without a record is between `Stopped` and `stop_turn`, which runs once the
-        // send task resolves, so it must not collapse before its outcome is recorded.
-        let last_turn_is_live_hint = has_pending_request_elicitation(thread.read(cx), cx)
-            || self.turn_fields.turn_lifecycle.is_live();
+        // `Self::has_pending_request_elicitation` reads `server_view`, which may be mid-update here.
+        // An owned turn has not recorded its outcome yet, so it must not collapse.
+        let last_turn_is_live_hint =
+            connection_has_pending_request_elicitation(thread.read(cx), cx)
+                || self.turn_fields.turn_lifecycle.is_live();
         let changed = self.entry_view_state.update(cx, |state, cx| {
             state.sync_presentation(&thread, last_turn_is_live_hint, cx)
         });
@@ -7461,7 +7477,7 @@ impl ThreadView {
                     centered_container(rendered.into_any_element()).into_any_element()
                 } else if this.generating_indicator_in_list {
                     let confirmation = this.thread.read(cx).is_waiting_for_confirmation()
-                        || has_pending_request_elicitation(this.thread.read(cx), cx);
+                        || this.has_pending_request_elicitation(cx);
                     let rendered = this.render_generating(confirmation, cx);
                     centered_container(rendered.into_any_element()).into_any_element()
                 } else {
@@ -8148,7 +8164,7 @@ impl ThreadView {
     ) -> impl IntoElement {
         let is_generating = matches!(thread.read(cx).status(), ThreadStatus::Generating);
         let needs_confirmation = thread.read(cx).is_waiting_for_confirmation()
-            || has_pending_request_elicitation(thread.read(cx), cx);
+            || self.has_pending_request_elicitation(cx);
 
         if is_thread_bottom && (is_generating || needs_confirmation) {
             return Empty.into_any_element();

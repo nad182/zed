@@ -281,7 +281,7 @@ fn run_from_members(members: &[usize]) -> Option<ToolCallRun> {
     })
 }
 
-pub(crate) fn has_pending_request_elicitation(thread: &AcpThread, cx: &App) -> bool {
+pub(crate) fn connection_has_pending_request_elicitation(thread: &AcpThread, cx: &App) -> bool {
     thread
         .connection()
         .request_elicitations()

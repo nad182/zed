@@ -1613,7 +1613,7 @@ impl ConversationView {
                 view_state.sync_entry_initial(ix, &thread, window, cx);
             }
             let pending_elicitation =
-                thread_collapse::has_pending_request_elicitation(thread.read(cx), cx);
+                thread_collapse::connection_has_pending_request_elicitation(thread.read(cx), cx);
             view_state.sync_presentation(&thread, pending_elicitation, cx);
             list_state.splice_focusable(
                 0..0,
