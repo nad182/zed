@@ -174,7 +174,8 @@ pub(crate) fn entry_kind(entry: &AgentThreadEntry, thread: &AcpThread, cx: &App)
             EntryKind::NeedsAction
         }
         AgentThreadEntry::ToolCall(tool_call) => EntryKind::ToolCall {
-            groupable: tool_call_is_groupable(tool_call),
+            groupable: tool_call_is_groupable(tool_call)
+                && !thread.is_user_authored_scroll_target(entry),
             renders: !tool_call_renders_nothing(tool_call, cx),
         },
         AgentThreadEntry::Elicitation(elicitation_id) => match thread.elicitation(elicitation_id) {

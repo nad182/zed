@@ -13141,6 +13141,79 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_answered_questions_end_tool_call_groups(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        apply_tool_call_updates(
+            &thread,
+            [
+                finished_read("read-1"),
+                finished_read("read-2"),
+                json!({"toolCallId": "ask", "title": "Which directory?", "kind": "other", "status": "in_progress"}),
+            ],
+            cx,
+        );
+
+        let response_task = thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation(
+                    acp_v2::CreateElicitationRequest::new(
+                        acp_v2::ElicitationFormMode::new(
+                            acp_v2::ElicitationSessionScope::new(session_id)
+                                .tool_call_id(acp_v2::ToolCallId::new("ask")),
+                            acp_v2::ElicitationSchema::new().string("other", true),
+                        ),
+                        "Which directory?",
+                    ),
+                    cx,
+                )
+                .expect("the question should be accepted")
+        });
+        let elicitation_id = thread
+            .read_with(cx, |thread, _| {
+                thread.entries().iter().find_map(|entry| match entry {
+                    AgentThreadEntry::Elicitation(id) => Some(id.clone()),
+                    _ => None,
+                })
+            })
+            .expect("the question should have an entry");
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_elicitation(
+                &elicitation_id,
+                acp_v2::CreateElicitationResponse::new(acp_v2::ElicitationAction::Accept(
+                    acp_v2::ElicitationAcceptAction::new().content(
+                        std::collections::BTreeMap::from([(
+                            "other".to_string(),
+                            acp_v2::ElicitationContentValue::from("src"),
+                        )]),
+                    ),
+                )),
+                cx,
+            );
+        });
+        response_task.await;
+        apply_tool_call_updates(
+            &thread,
+            [
+                json!({"toolCallId": "ask", "status": "completed"}),
+                finished_read("read-3"),
+                finished_read("read-4"),
+            ],
+            cx,
+        );
+
+        assert_eq!(
+            tool_call_group_layout(&thread_view, cx),
+            (vec![(0, 2, false), (4, 2, false)], vec![0, 1, 4, 5])
+        );
+    }
+
+    #[gpui::test]
     async fn test_subagent_preview_starting_inside_a_group_shows_the_group_row(
         cx: &mut TestAppContext,
     ) {
