@@ -116,6 +116,7 @@ mod subagent_card;
 pub(crate) mod thread_collapse;
 mod thread_search_bar;
 mod thread_view;
+pub(crate) mod turn_lifecycle;
 pub use message_queue::*;
 pub use thread_view::*;
 
@@ -1080,7 +1081,9 @@ impl ConversationView {
         let mut subscriptions = vec![
             cx.observe_global_in::<SettingsStore>(window, Self::agent_ui_font_size_changed),
             cx.observe_global_in::<SettingsStore>(window, Self::invalidate_mermaid_caches),
-            cx.observe_global_in::<SettingsStore>(window, Self::sync_thread_presentations),
+            cx.observe_global_in::<SettingsStore>(window, |this, _window, cx| {
+                this.sync_thread_presentations(cx)
+            }),
             cx.observe_global_in::<AgentUiFontSize>(window, Self::agent_ui_font_size_changed),
             cx.observe_global_in::<AgentBufferFontSize>(window, Self::agent_ui_font_size_changed),
             cx.subscribe_in(
@@ -1199,6 +1202,7 @@ impl ConversationView {
     ) -> Option<Subscription> {
         let store = connection.request_elicitations()?;
         Some(cx.observe(&store, |this, _store, cx| {
+            this.sync_thread_presentations(cx);
             if let Some(active_thread) = this.active_thread().cloned() {
                 active_thread.update(cx, |_thread, cx| cx.notify());
             }
@@ -1608,7 +1612,9 @@ impl ConversationView {
             for ix in 0..count {
                 view_state.sync_entry_initial(ix, &thread, window, cx);
             }
-            view_state.sync_presentation(&thread, cx);
+            let pending_elicitation =
+                thread_collapse::connection_has_pending_request_elicitation(thread.read(cx), cx);
+            view_state.sync_presentation(&thread, pending_elicitation, cx);
             list_state.splice_focusable(
                 0..0,
                 (0..count).map(|ix| view_state.entry(ix)?.focus_handle(cx)),
@@ -1962,6 +1968,7 @@ impl ConversationView {
             AcpThreadEvent::StatusChanged => {
                 if let Some(active) = self.thread_view(&session_id) {
                     active.update(cx, |active, cx| {
+                        active.sync_reported_turn(cx);
                         active.sync_reported_activity(cx);
                         active.sync_generating_indicator(cx);
                         active.sync_presentation(cx);
@@ -1982,6 +1989,10 @@ impl ConversationView {
             AcpThreadEvent::NewEntry => {
                 let len = thread.read(cx).entries().len();
                 let index = len - 1;
+                let is_user_message = matches!(
+                    thread.read(cx).entries().last(),
+                    Some(AgentThreadEntry::UserMessage(_))
+                );
                 if let Some(active) = self.thread_view(&session_id) {
                     let entry_view_state = active.read(cx).entry_view_state.clone();
                     let list_state = active.read(cx).list_state.clone();
@@ -1995,6 +2006,9 @@ impl ConversationView {
                         );
                     });
                     active.update(cx, |active, cx| {
+                        if is_user_message {
+                            active.user_message_pushed(index);
+                        }
                         active.sync_elicitation_state_for_entry(index, window, cx);
                         active.sync_editor_mode(cx);
                         active.sync_generating_indicator(cx);
@@ -2031,6 +2045,7 @@ impl ConversationView {
                     entry_view_state.update(cx, |view_state, _cx| view_state.remove(range.clone()));
                     list_state.splice(range.clone(), 0);
                     active.update(cx, |active, cx| {
+                        active.entries_removed(range);
                         active.sync_editor_mode(cx);
                         active.sync_presentation(cx);
                     });
@@ -2065,7 +2080,6 @@ impl ConversationView {
                 activity_duration,
                 stop_reason,
             } => {
-                self.sync_thread_presentation(&session_id, cx);
                 if thread.read(cx).uses_reported_activity()
                     && let Some(active) = self.thread_view(&session_id)
                 {
@@ -2082,6 +2096,8 @@ impl ConversationView {
                     let is_generating =
                         matches!(thread.read(cx).status(), ThreadStatus::Generating);
                     active.update(cx, |active, cx| {
+                        active.finish_turn(stop_reason.as_ref(), *activity_duration, cx);
+                        active.sync_presentation(cx);
                         if !is_generating {
                             if thread.read(cx).uses_reported_activity() {
                                 active.sync_follow_agent_state(cx);
@@ -2200,6 +2216,7 @@ impl ConversationView {
                 let error = ThreadError::Refusal;
                 if let Some(active) = self.thread_view(&session_id) {
                     active.update(cx, |active, cx| {
+                        active.interrupt_turn();
                         active.handle_thread_error(error, cx);
                         active.thread_retry_status.take();
                     });
@@ -2216,6 +2233,7 @@ impl ConversationView {
                     let is_generating =
                         matches!(thread.read(cx).status(), ThreadStatus::Generating);
                     active.update(cx, |active, cx| {
+                        active.interrupt_turn();
                         if !is_generating {
                             active.thread_retry_status.take();
                             if active.list_state.is_following_tail() {
@@ -3724,7 +3742,7 @@ impl ConversationView {
         }
     }
 
-    fn sync_thread_presentations(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn sync_thread_presentations(&self, cx: &mut Context<Self>) {
         let Some(connected) = self.as_connected() else {
             return;
         };
@@ -12637,11 +12655,17 @@ pub(crate) mod tests {
             let entry_view_state = view.entry_view_state.read(cx);
             let entry_count = view.thread.read(cx).entries().len();
             let headers = (0..entry_count)
-                .filter_map(|entry_ix| {
-                    let thread_collapse::Header::ToolCallGroup {
-                        count, is_expanded, ..
-                    } = entry_view_state.presentation(entry_ix)?.header.as_ref()?;
-                    Some((entry_ix, *count, *is_expanded))
+                .filter_map(|entry_ix| Some((entry_ix, entry_view_state.presentation(entry_ix)?)))
+                .flat_map(|(entry_ix, presentation)| {
+                    presentation
+                        .headers
+                        .iter()
+                        .filter_map(move |header| match header {
+                            thread_collapse::Header::ToolCallGroup {
+                                count, is_expanded, ..
+                            } => Some((entry_ix, *count, *is_expanded)),
+                            thread_collapse::Header::TurnSummary { .. } => None,
+                        })
                 })
                 .collect();
             let hidden = (0..entry_count)
@@ -12969,10 +12993,13 @@ pub(crate) mod tests {
             cx.run_until_parked();
         }
         thread_view.update(cx, |view, cx| {
-            view.toggle_collapse(
+            for key in [
+                thread_collapse::CollapseKey::Turn(0),
+                thread_collapse::CollapseKey::Turn(4),
                 thread_collapse::CollapseKey::ToolCalls(acp_v2::ToolCallId::new("read-3")),
-                cx,
-            );
+            ] {
+                view.toggle_collapse(key, cx);
+            }
         });
         assert_eq!(
             tool_call_group_layout(&thread_view, cx),
@@ -13008,6 +13035,1512 @@ pub(crate) mod tests {
                     .is_none()
             );
         });
+    }
+
+    fn turn_summaries(
+        thread_view: &Entity<ThreadView>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<(usize, Option<Duration>, bool)> {
+        thread_view.read_with(cx, |view, cx| {
+            let entry_view_state = view.entry_view_state.read(cx);
+            (0..view.thread.read(cx).entries().len())
+                .filter_map(|entry_ix| Some((entry_ix, entry_view_state.presentation(entry_ix)?)))
+                .flat_map(|(entry_ix, presentation)| {
+                    presentation
+                        .headers
+                        .iter()
+                        .filter_map(move |header| match header {
+                            thread_collapse::Header::TurnSummary {
+                                duration,
+                                is_expanded,
+                                ..
+                            } => Some((entry_ix, *duration, *is_expanded)),
+                            thread_collapse::Header::ToolCallGroup { .. } => None,
+                        })
+                })
+                .collect()
+        })
+    }
+
+    fn turn_record(
+        thread_view: &Entity<ThreadView>,
+        user_message_ix: usize,
+        cx: &mut VisualTestContext,
+    ) -> Option<turn_lifecycle::TurnRecord> {
+        thread_view.read_with(cx, |view, cx| {
+            view.entry_view_state
+                .read(cx)
+                .turn_record(user_message_ix)
+                .copied()
+        })
+    }
+
+    fn send_prompt(
+        conversation_view: &Entity<ConversationView>,
+        text: &str,
+        cx: &mut VisualTestContext,
+    ) {
+        let message_editor = message_editor(conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| editor.set_text(text, window, cx));
+        active_thread(conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+    }
+
+    fn send_native_command(thread_view: &Entity<ThreadView>, cx: &mut VisualTestContext) {
+        thread_view.update_in(cx, |view, window, cx| {
+            let contents = Task::ready(Ok(Some((vec!["/compact".into()], Vec::new()))));
+            view.send_content(contents, true, window, cx);
+        });
+        cx.run_until_parked();
+    }
+
+    fn finished_read_update(tool_call_id: &str, title: &str) -> acp_v1::SessionUpdate {
+        acp_v1::SessionUpdate::ToolCall(
+            acp_v1::ToolCall::new(tool_call_id.to_string(), title.to_string())
+                .kind(acp_v1::ToolKind::Read)
+                .status(acp_v1::ToolCallStatus::Completed),
+        )
+    }
+
+    fn message_update(text: &str) -> acp_v1::SessionUpdate {
+        acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(text.into()))
+    }
+
+    fn thought_update(text: &str) -> acp_v1::SessionUpdate {
+        acp_v1::SessionUpdate::AgentThoughtChunk(acp_v1::ContentChunk::new(text.into()))
+    }
+
+    #[gpui::test]
+    async fn test_native_command_keeps_the_previous_turn_record(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let session_id =
+            thread_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+
+        send_native_command(&thread_view, cx);
+        connection.end_turn(session_id.clone(), acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+        assert_eq!(turn_record(&thread_view, 0, cx), None);
+
+        connection.set_next_prompt_updates(vec![
+            finished_read_update("read-1", "Read file"),
+            message_update("Done."),
+        ]);
+        send_prompt(&conversation_view, "First prompt", cx);
+        let record = turn_record(&thread_view, 0, cx).expect("the prompt should own its turn");
+        assert_eq!(record.outcome, turn_lifecycle::TurnOutcome::Finished);
+        assert!(record.duration.is_some());
+        assert_eq!(
+            turn_summaries(&thread_view, cx),
+            vec![(1, record.duration, false)]
+        );
+
+        send_native_command(&thread_view, cx);
+        connection.end_turn(session_id, acp_v1::StopReason::Cancelled);
+        cx.run_until_parked();
+        assert_eq!(turn_record(&thread_view, 0, cx), Some(record));
+        assert_eq!(
+            turn_summaries(&thread_view, cx),
+            vec![(1, record.duration, false)]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_reported_activity_records_only_turns_with_a_new_prompt(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let connection = StubAgentConnection::new().with_receipt_submissions(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let run_activity = |prompt: Option<&str>, cx: &mut VisualTestContext| {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .update_session_state(
+                        acp_v2::StateUpdate::Running(acp_v2::RunningStateUpdate::new()),
+                        cx,
+                    )
+                    .expect("running state update");
+                if let Some(prompt) = prompt {
+                    thread
+                        .upsert_user_message(
+                            acp_v2::UserMessage::new(prompt.to_string())
+                                .content(vec![prompt.into()]),
+                            cx,
+                        )
+                        .expect("user message echo");
+                }
+            });
+            cx.run_until_parked();
+            if prompt.is_some() {
+                apply_tool_call_updates(&thread, [finished_read("read-1")], cx);
+                thread.update(cx, |thread, cx| {
+                    thread
+                        .handle_session_update(message_update("Done."), cx)
+                        .expect("message update");
+                });
+            }
+            thread.update(cx, |thread, cx| {
+                thread
+                    .update_session_state(
+                        acp_v2::StateUpdate::Idle(
+                            acp_v2::IdleStateUpdate::new().stop_reason(acp_v2::StopReason::EndTurn),
+                        ),
+                        cx,
+                    )
+                    .expect("idle state update");
+            });
+            cx.run_until_parked();
+        };
+
+        run_activity(None, cx);
+        assert_eq!(turn_record(&thread_view, 0, cx), None);
+
+        run_activity(Some("First prompt"), cx);
+        let record = turn_record(&thread_view, 0, cx).expect("the prompt should own its turn");
+        assert_eq!(
+            record,
+            turn_lifecycle::TurnRecord {
+                duration: thread.read_with(cx, |thread, _| thread.activity_duration()),
+                outcome: turn_lifecycle::TurnOutcome::Finished,
+            }
+        );
+        assert!(record.duration.is_some());
+        thread_view.read_with(cx, |view, _| {
+            assert_eq!(view.turn_fields.last_turn_duration, record.duration);
+        });
+
+        run_activity(None, cx);
+        assert_eq!(turn_record(&thread_view, 0, cx), Some(record));
+    }
+
+    async fn reported_activity_thread(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<ConversationView>,
+        Entity<ThreadView>,
+        Entity<AcpThread>,
+        &mut VisualTestContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let connection = StubAgentConnection::new().with_receipt_submissions(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        (conversation_view, thread_view, thread, cx)
+    }
+
+    fn report_state(
+        thread: &Entity<AcpThread>,
+        state: serde_json::Value,
+        cx: &mut VisualTestContext,
+    ) {
+        let state: acp_v2::StateUpdate =
+            serde_json::from_value(state).expect("state update should deserialize");
+        thread.update(cx, |thread, cx| {
+            thread
+                .update_session_state(state, cx)
+                .expect("state update should apply")
+        });
+        cx.run_until_parked();
+    }
+
+    fn run_reported_prompt(thread: &Entity<AcpThread>, prompt: &str, cx: &mut VisualTestContext) {
+        report_state(thread, json!({"state": "running"}), cx);
+        thread.update(cx, |thread, cx| {
+            thread
+                .upsert_user_message(
+                    acp_v2::UserMessage::new(prompt.to_string()).content(vec![prompt.into()]),
+                    cx,
+                )
+                .expect("user message echo");
+        });
+        cx.run_until_parked();
+        apply_tool_call_updates(thread, [finished_read(&format!("read-{prompt}"))], cx);
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(message_update("Done."), cx)
+                .expect("message update");
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_reported_idle_with_usage_keeps_stop_reason(cx: &mut TestAppContext) {
+        for (stop_reason, expected) in [
+            ("cancelled", turn_lifecycle::TurnOutcome::Interrupted),
+            ("max_tokens", turn_lifecycle::TurnOutcome::Interrupted),
+            ("refusal", turn_lifecycle::TurnOutcome::Interrupted),
+            ("end_turn", turn_lifecycle::TurnOutcome::Finished),
+        ] {
+            let (_conversation_view, thread_view, thread, cx) = reported_activity_thread(cx).await;
+            run_reported_prompt(&thread, "Prompt", cx);
+            report_state(
+                &thread,
+                json!({
+                    "state": "idle", "stopReason": stop_reason,
+                    "usage": {"totalTokens": 12, "inputTokens": 5, "outputTokens": 7}
+                }),
+                cx,
+            );
+
+            let record = turn_record(&thread_view, 0, cx).expect("the prompt should own its turn");
+            assert_eq!(record.outcome, expected, "{stop_reason}");
+            assert_eq!(
+                record.duration,
+                thread.read_with(cx, |thread, _| thread.activity_duration()),
+                "{stop_reason}"
+            );
+            let expected_summaries = match expected {
+                turn_lifecycle::TurnOutcome::Finished => vec![(1, record.duration, false)],
+                _ => vec![],
+            };
+            assert_eq!(
+                turn_summaries(&thread_view, cx),
+                expected_summaries,
+                "{stop_reason}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_reported_error_keeps_turn_expanded(cx: &mut TestAppContext) {
+        let (_conversation_view, thread_view, thread, cx) = reported_activity_thread(cx).await;
+        run_reported_prompt(&thread, "Prompt", cx);
+        let _no_transient_summary =
+            assert_no_turn_summary_on_presentation_change(&thread_view, "error".to_string(), cx);
+        report_state(
+            &thread,
+            json!({"state": "idle", "stopReason": "error", "error": {"code": -32603, "message": "Internal error"}}),
+            cx,
+        );
+
+        assert_eq!(
+            turn_record(&thread_view, 0, cx).map(|record| record.outcome),
+            Some(turn_lifecycle::TurnOutcome::Interrupted)
+        );
+        assert_eq!(turn_summaries(&thread_view, cx), vec![]);
+    }
+
+    #[gpui::test]
+    async fn test_reported_compact_marker_leaves_previous_turn_collapsed(cx: &mut TestAppContext) {
+        let (_conversation_view, thread_view, thread, cx) = reported_activity_thread(cx).await;
+        run_reported_prompt(&thread, "Prompt", cx);
+        report_state(
+            &thread,
+            json!({"state": "idle", "stopReason": "end_turn"}),
+            cx,
+        );
+        let record = turn_record(&thread_view, 0, cx).expect("the prompt should own its turn");
+
+        report_state(&thread, json!({"state": "running"}), cx);
+        thread.update(cx, |thread, cx| {
+            thread
+                .upsert_local_user_message(acp_thread::ClientUserMessageId::new(), Vec::new(), cx)
+                .expect("command marker");
+        });
+        cx.run_until_parked();
+        report_state(
+            &thread,
+            json!({"state": "idle", "stopReason": "end_turn"}),
+            cx,
+        );
+
+        assert_eq!(turn_record(&thread_view, 0, cx), Some(record));
+        assert_eq!(
+            turn_summaries(&thread_view, cx),
+            vec![(1, record.duration, false)]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_unconfirmed_gap_keeps_live_reported_turn(cx: &mut TestAppContext) {
+        let (_conversation_view, thread_view, thread, cx) = reported_activity_thread(cx).await;
+        run_reported_prompt(&thread, "Prompt", cx);
+        thread.update(cx, |thread, cx| {
+            thread
+                .clear_session_state(cx)
+                .expect("reported state should clear")
+        });
+        cx.run_until_parked();
+        report_state(&thread, json!({"state": "running"}), cx);
+        thread_view.read_with(cx, |view, _| {
+            assert!(view.turn_fields.turn_lifecycle.is_live());
+        });
+        assert_eq!(turn_record(&thread_view, 0, cx), None);
+
+        report_state(
+            &thread,
+            json!({"state": "idle", "stopReason": "end_turn"}),
+            cx,
+        );
+        let record = turn_record(&thread_view, 0, cx).expect("the prompt should own its turn");
+        assert_eq!(record.outcome, turn_lifecycle::TurnOutcome::Finished);
+        assert_eq!(
+            turn_summaries(&thread_view, cx),
+            vec![(1, record.duration, false)]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_unconfirmed_last_turn_stays_expanded(cx: &mut TestAppContext) {
+        let (_conversation_view, thread_view, thread, cx) = reported_activity_thread(cx).await;
+        thread.update(cx, |thread, cx| thread.mark_activity_unconfirmed(cx));
+        thread.update(cx, |thread, cx| {
+            thread
+                .upsert_user_message(
+                    acp_v2::UserMessage::new("restored").content(vec!["Restored".into()]),
+                    cx,
+                )
+                .expect("restored user message");
+        });
+        cx.run_until_parked();
+        apply_tool_call_updates(&thread, [finished_read("read-restored")], cx);
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(message_update("Done."), cx)
+                .expect("message update");
+        });
+        cx.run_until_parked();
+        assert_eq!(turn_summaries(&thread_view, cx), vec![]);
+
+        report_state(&thread, json!({"state": "idle"}), cx);
+        assert_eq!(turn_summaries(&thread_view, cx), vec![(1, None, false)]);
+    }
+
+    #[gpui::test]
+    async fn test_unknown_activity_does_not_start_a_turn(cx: &mut TestAppContext) {
+        let (_conversation_view, thread_view, thread, cx) = reported_activity_thread(cx).await;
+        thread.update(cx, |thread, cx| {
+            thread
+                .upsert_user_message(
+                    acp_v2::UserMessage::new("restored").content(vec!["Restored".into()]),
+                    cx,
+                )
+                .expect("restored user message");
+        });
+        cx.run_until_parked();
+
+        report_state(&thread, json!({"state": "unknown"}), cx);
+        thread_view.read_with(cx, |view, _| {
+            assert!(!view.turn_fields.turn_lifecycle.is_live());
+        });
+        report_state(&thread, json!({"state": "idle"}), cx);
+        assert_eq!(turn_record(&thread_view, 0, cx), None);
+    }
+
+    #[gpui::test]
+    async fn test_interrupted_turns_stay_expanded(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+
+        for cancel in [true, false] {
+            let connection = StubAgentConnection::new();
+            let (conversation_view, cx) =
+                setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+            let thread_view = active_thread(&conversation_view, cx);
+            let session_id =
+                thread_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+            let finish_with_error = (!cancel).then(|| connection.defer_next_prompt_response());
+
+            send_prompt(&conversation_view, "Prompt", cx);
+            for update in [
+                finished_read_update("read-1", "Read file"),
+                message_update("Partial answer"),
+            ] {
+                cx.update(|_, cx| connection.send_update(session_id.clone(), update, cx));
+                cx.run_until_parked();
+            }
+            let _no_transient_summary = assert_no_turn_summary_on_presentation_change(
+                &thread_view,
+                format!("cancel: {cancel}"),
+                cx,
+            );
+
+            match finish_with_error {
+                Some(finish) => finish
+                    .send(Err(anyhow!("connection lost")))
+                    .expect("prompt response should be pending"),
+                None => {
+                    thread_view.update_in(cx, |view, _window, cx| view.cancel_generation(cx));
+                    assert_eq!(
+                        turn_summaries(&thread_view, cx),
+                        vec![],
+                        "right after cancel"
+                    );
+                }
+            }
+            cx.run_until_parked();
+
+            assert_eq!(
+                turn_record(&thread_view, 0, cx).map(|record| record.outcome),
+                Some(turn_lifecycle::TurnOutcome::Interrupted),
+                "cancel: {cancel}"
+            );
+            assert_eq!(turn_summaries(&thread_view, cx), vec![], "cancel: {cancel}");
+            thread_view.read_with(cx, |view, cx| {
+                let entry_view_state = view.entry_view_state.read(cx);
+                for entry_ix in 0..view.thread.read(cx).entries().len() {
+                    assert!(
+                        entry_view_state
+                            .presentation(entry_ix)
+                            .is_none_or(|presentation| presentation.is_full()),
+                        "cancel: {cancel}, entry {entry_ix}"
+                    );
+                }
+            });
+        }
+    }
+
+    fn assert_no_turn_summary_on_presentation_change(
+        thread_view: &Entity<ThreadView>,
+        context: String,
+        cx: &mut VisualTestContext,
+    ) -> Subscription {
+        let entry_view_state = thread_view.read_with(cx, |view, _| view.entry_view_state.clone());
+        cx.update(|_, cx| {
+            cx.subscribe(
+                &entry_view_state,
+                move |entry_view_state, _: &crate::entry_view_state::PresentationChanged, cx| {
+                    let entry_view_state = entry_view_state.read(cx);
+                    let has_turn_summary = (0..)
+                        .map_while(|entry_ix| entry_view_state.presentation(entry_ix))
+                        .flat_map(|presentation| &presentation.headers)
+                        .any(|header| {
+                            matches!(header, thread_collapse::Header::TurnSummary { .. })
+                        });
+                    assert!(!has_turn_summary, "{context}");
+                },
+            )
+        })
+    }
+
+    #[gpui::test]
+    async fn test_refused_turns_stay_expanded(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let session_id =
+            thread_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        let finish = connection.defer_next_prompt_response();
+
+        send_prompt(&conversation_view, "Prompt", cx);
+        let read_with_output = acp_v1::SessionUpdate::ToolCall(
+            acp_v1::ToolCall::new("read-1", "Read file")
+                .kind(acp_v1::ToolKind::Read)
+                .status(acp_v1::ToolCallStatus::Completed)
+                .raw_output(json!({"contents": "File contents"})),
+        );
+        for update in [read_with_output, message_update("Partial answer")] {
+            cx.update(|_, cx| connection.send_update(session_id.clone(), update, cx));
+            cx.run_until_parked();
+        }
+        let _no_transient_summary =
+            assert_no_turn_summary_on_presentation_change(&thread_view, "refusal".to_string(), cx);
+        finish
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::Refusal)))
+            .expect("prompt response should be pending");
+        cx.run_until_parked();
+
+        assert_eq!(
+            turn_record(&thread_view, 0, cx).map(|record| record.outcome),
+            Some(turn_lifecycle::TurnOutcome::Interrupted)
+        );
+        assert_eq!(turn_summaries(&thread_view, cx), vec![]);
+    }
+
+    #[gpui::test]
+    async fn test_stale_stop_keeps_current_turn_outcome(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let connection = StubAgentConnection::new().with_receipt_submissions(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread
+                .update_session_state(
+                    acp_v2::StateUpdate::Running(acp_v2::RunningStateUpdate::new()),
+                    cx,
+                )
+                .expect("running state update");
+            thread
+                .upsert_user_message(
+                    acp_v2::UserMessage::new("prompt-b").content(vec!["Prompt B".into()]),
+                    cx,
+                )
+                .expect("user message echo");
+        });
+        cx.run_until_parked();
+        apply_tool_call_updates(&thread, [finished_read("read-b")], cx);
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(message_update("Done."), cx)
+                .expect("message update");
+        });
+        cx.run_until_parked();
+
+        let stale_duration = Duration::from_secs(999);
+        thread.update(cx, |thread, cx| {
+            cx.emit(AcpThreadEvent::Stopped {
+                activity_generation: thread.activity_generation().saturating_sub(1),
+                activity_duration: Some(stale_duration),
+                stop_reason: Some(acp_v2::StopReason::Cancelled),
+            });
+        });
+        cx.run_until_parked();
+        thread.update(cx, |thread, cx| {
+            thread
+                .update_session_state(
+                    acp_v2::StateUpdate::Idle(
+                        acp_v2::IdleStateUpdate::new().stop_reason(acp_v2::StopReason::EndTurn),
+                    ),
+                    cx,
+                )
+                .expect("idle state update");
+        });
+        cx.run_until_parked();
+
+        let record = turn_record(&thread_view, 0, cx).expect("the prompt should own its turn");
+        assert_eq!(record.outcome, turn_lifecycle::TurnOutcome::Finished);
+        assert_ne!(record.duration, Some(stale_duration));
+        assert_eq!(
+            record.duration,
+            thread.read_with(cx, |thread, _| thread.activity_duration())
+        );
+    }
+
+    #[gpui::test]
+    async fn test_stopping_an_idle_thread_does_not_interrupt_the_next_turn(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+
+        thread_view.update_in(cx, |view, _window, cx| view.cancel_generation(cx));
+        cx.run_until_parked();
+        thread_view.read_with(cx, |view, _| {
+            assert_eq!(view.turn_fields.turn_lifecycle.outcome(), None);
+        });
+
+        connection.set_next_prompt_updates(vec![
+            finished_read_update("read-1", "Read file"),
+            message_update("Done."),
+        ]);
+        send_prompt(&conversation_view, "Prompt", cx);
+        assert_eq!(
+            turn_record(&thread_view, 0, cx).map(|record| record.outcome),
+            Some(turn_lifecycle::TurnOutcome::Finished)
+        );
+        assert_eq!(turn_summaries(&thread_view, cx).len(), 1);
+    }
+
+    #[derive(Clone, Default)]
+    struct FailThenRetryConnection {
+        thread: Arc<Mutex<Option<WeakEntity<AcpThread>>>>,
+        prompt_count: Arc<Mutex<usize>>,
+        pending_retry: Arc<
+            Mutex<Option<futures::channel::oneshot::Sender<gpui::Result<acp_v1::PromptResponse>>>>,
+        >,
+    }
+
+    impl FailThenRetryConnection {
+        fn finish_retry(&self, response: gpui::Result<acp_v1::PromptResponse>) {
+            self.pending_retry
+                .lock()
+                .take()
+                .expect("a retry should be running")
+                .send(response)
+                .expect("the retry should be waiting for its response");
+        }
+
+        fn answer(
+            &self,
+            updates: Vec<acp_v1::SessionUpdate>,
+            response: impl 'static + Future<Output = gpui::Result<acp_v1::PromptResponse>>,
+            cx: &mut App,
+        ) -> Task<gpui::Result<acp_v1::PromptResponse>> {
+            let thread = self
+                .thread
+                .lock()
+                .clone()
+                .expect("the session should exist");
+            cx.spawn(async move |cx| {
+                for update in updates {
+                    thread.update(cx, |thread, cx| thread.handle_session_update(update, cx))??;
+                }
+                response.await
+            })
+        }
+    }
+
+    impl AgentConnection for FailThenRetryConnection {
+        fn agent_id(&self) -> AgentId {
+            AgentId::new("fail-then-retry")
+        }
+
+        fn telemetry_id(&self) -> SharedString {
+            "fail-then-retry".into()
+        }
+
+        fn auth_methods(&self) -> &[acp_v2::AuthMethod] {
+            &[]
+        }
+
+        fn authenticate(
+            &self,
+            _method_id: acp_v2::AuthMethodId,
+            _cx: &mut App,
+        ) -> Task<gpui::Result<()>> {
+            Task::ready(Ok(()))
+        }
+
+        fn new_session(
+            self: Rc<Self>,
+            project: Entity<Project>,
+            _work_dirs: PathList,
+            cx: &mut App,
+        ) -> Task<gpui::Result<Entity<AcpThread>>> {
+            let thread = build_test_thread(
+                self.clone(),
+                project,
+                "Fail then retry",
+                acp_v2::SessionId::new("fail-then-retry"),
+                cx,
+            );
+            *self.thread.lock() = Some(thread.downgrade());
+            Task::ready(Ok(thread))
+        }
+
+        fn prompt(
+            &self,
+            _params: acp_v2::PromptRequest,
+            cx: &mut App,
+        ) -> Task<gpui::Result<acp_v1::PromptResponse>> {
+            let prompt_ix = {
+                let mut prompt_count = self.prompt_count.lock();
+                *prompt_count += 1;
+                *prompt_count - 1
+            };
+            if prompt_ix == 0 {
+                return Task::ready(Err(anyhow!("prompt failed")));
+            }
+            self.answer(
+                vec![
+                    finished_read_update(&format!("read-{prompt_ix}"), "Read file"),
+                    message_update("Answer."),
+                ],
+                async { Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)) },
+                cx,
+            )
+        }
+
+        fn retry(
+            &self,
+            _session_id: &acp_v2::SessionId,
+            _cx: &App,
+        ) -> Option<Rc<dyn acp_thread::AgentSessionRetry>> {
+            Some(Rc::new(self.clone()))
+        }
+
+        fn cancel(&self, _session_id: &acp_v2::SessionId, _cx: &mut App) -> gpui::Result<()> {
+            Ok(())
+        }
+
+        fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+            self
+        }
+    }
+
+    impl acp_thread::AgentSessionRetry for FailThenRetryConnection {
+        fn run(&self, cx: &mut App) -> Task<gpui::Result<acp_v1::PromptResponse>> {
+            let (sender, receiver) = futures::channel::oneshot::channel();
+            *self.pending_retry.lock() = Some(sender);
+            self.answer(
+                vec![
+                    finished_read_update("retry-read", "Read file"),
+                    message_update("Done after retry."),
+                ],
+                async move { receiver.await? },
+                cx,
+            )
+        }
+    }
+
+    async fn retry_failed_prompt(
+        cx: &mut TestAppContext,
+    ) -> (
+        FailThenRetryConnection,
+        Entity<ConversationView>,
+        Entity<ThreadView>,
+        &mut VisualTestContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let connection = FailThenRetryConnection::default();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+
+        send_prompt(&conversation_view, "Prompt", cx);
+        assert_eq!(
+            turn_record(&thread_view, 0, cx).map(|record| record.outcome),
+            Some(turn_lifecycle::TurnOutcome::Interrupted)
+        );
+
+        thread_view.update(cx, |view, cx| view.retry_generation(cx));
+        cx.run_until_parked();
+        thread_view.read_with(cx, |view, cx| {
+            assert_eq!(view.thread.read(cx).entries().len(), 3);
+            assert!(view.turn_fields.turn_lifecycle.is_live());
+        });
+        assert_eq!(turn_summaries(&thread_view, cx), vec![]);
+        (connection, conversation_view, thread_view, cx)
+    }
+
+    #[gpui::test]
+    async fn test_successful_retry_finishes_the_failed_turn(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let connection = StubAgentConnection::new().with_retry();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let session_id =
+            thread_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        let fail = connection.defer_next_prompt_response();
+
+        send_prompt(&conversation_view, "Prompt", cx);
+        for update in [
+            finished_read_update("read-1", "Read file"),
+            message_update("Partial answer"),
+        ] {
+            cx.update(|_, cx| connection.send_update(session_id.clone(), update, cx));
+            cx.run_until_parked();
+        }
+        fail.send(Err(anyhow!("prompt failed")))
+            .expect("prompt response should be pending");
+        cx.run_until_parked();
+        assert_eq!(
+            turn_record(&thread_view, 0, cx).map(|record| record.outcome),
+            Some(turn_lifecycle::TurnOutcome::Interrupted)
+        );
+
+        thread_view.update(cx, |view, cx| view.retry_generation(cx));
+        cx.run_until_parked();
+
+        let record = turn_record(&thread_view, 0, cx).expect("the prompt should own its turn");
+        assert_eq!(record.outcome, turn_lifecycle::TurnOutcome::Finished);
+        assert_eq!(
+            turn_summaries(&thread_view, cx),
+            vec![(1, record.duration, false)]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_failed_retry_keeps_the_turn_interrupted(cx: &mut TestAppContext) {
+        let (connection, _conversation_view, thread_view, cx) = retry_failed_prompt(cx).await;
+
+        connection.finish_retry(Err(anyhow!("retry failed")));
+        cx.run_until_parked();
+
+        assert_eq!(
+            turn_record(&thread_view, 0, cx).map(|record| record.outcome),
+            Some(turn_lifecycle::TurnOutcome::Interrupted)
+        );
+        assert_eq!(turn_summaries(&thread_view, cx), vec![]);
+    }
+
+    #[gpui::test]
+    async fn test_superseded_retry_does_not_record_over_the_next_turn(cx: &mut TestAppContext) {
+        let (connection, _conversation_view, thread_view, cx) = retry_failed_prompt(cx).await;
+
+        thread_view.update_in(cx, |view, window, cx| {
+            let contents = Task::ready(Ok(Some((vec!["Follow-up".into()], Vec::new()))));
+            view.send_content(contents, false, window, cx);
+        });
+        cx.run_until_parked();
+        connection.finish_retry(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)));
+        cx.run_until_parked();
+
+        let follow_up_ix = thread_view
+            .read_with(cx, |view, cx| {
+                view.thread
+                    .read(cx)
+                    .entries()
+                    .iter()
+                    .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+            })
+            .expect("the follow-up should be in the thread");
+        assert!(follow_up_ix > 0);
+        assert_eq!(
+            turn_record(&thread_view, 0, cx).map(|record| record.outcome),
+            Some(turn_lifecycle::TurnOutcome::Interrupted)
+        );
+        let record =
+            turn_record(&thread_view, follow_up_ix, cx).expect("the follow-up should own its turn");
+        assert_eq!(record.outcome, turn_lifecycle::TurnOutcome::Finished);
+        assert_eq!(
+            turn_summaries(&thread_view, cx),
+            vec![(follow_up_ix + 1, record.duration, false)]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_retrying_a_failed_command_keeps_the_previous_turn_record(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let connection = StubAgentConnection::new().with_retry();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+
+        connection.set_next_prompt_updates(vec![
+            finished_read_update("read-1", "Read file"),
+            message_update("Answer."),
+        ]);
+        send_prompt(&conversation_view, "Prompt", cx);
+        let record = turn_record(&thread_view, 0, cx).expect("the prompt should own its turn");
+        assert_eq!(record.outcome, turn_lifecycle::TurnOutcome::Finished);
+
+        let fail = connection.defer_next_prompt_response();
+        send_native_command(&thread_view, cx);
+        fail.send(Err(anyhow!("command failed")))
+            .expect("command response should be pending");
+        cx.run_until_parked();
+        thread_view.update(cx, |view, cx| view.retry_generation(cx));
+        cx.run_until_parked();
+
+        assert_eq!(turn_record(&thread_view, 0, cx), Some(record));
+        assert_eq!(
+            turn_summaries(&thread_view, cx),
+            vec![(1, record.duration, false)]
+        );
+    }
+
+    async fn reported_retry_thread(
+        collapse_finished_turns: bool,
+        cx: &mut TestAppContext,
+    ) -> (
+        StubAgentConnection,
+        Entity<ConversationView>,
+        Entity<ThreadView>,
+        Entity<AcpThread>,
+        &mut VisualTestContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(collapse_finished_turns, cx));
+        let connection = StubAgentConnection::new()
+            .with_receipt_submissions(true)
+            .with_retry();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        run_reported_prompt(&thread, "Prompt", cx);
+        report_state(
+            &thread,
+            json!({
+                "state": "idle", "stopReason": "error",
+                "usage": {"totalTokens": 12, "inputTokens": 5, "outputTokens": 7}
+            }),
+            cx,
+        );
+        assert_eq!(
+            turn_record(&thread_view, 0, cx).map(|record| record.outcome),
+            Some(turn_lifecycle::TurnOutcome::Interrupted)
+        );
+        (connection, conversation_view, thread_view, thread, cx)
+    }
+
+    #[gpui::test]
+    async fn test_reported_retry_finishes_the_failed_turn(cx: &mut TestAppContext) {
+        let (connection, _conversation_view, thread_view, thread, cx) =
+            reported_retry_thread(true, cx).await;
+
+        let accept = connection.defer_next_receipt_response();
+        thread_view.update(cx, |view, cx| view.retry_generation(cx));
+        cx.run_until_parked();
+        report_state(&thread, json!({"state": "running"}), cx);
+        accept
+            .send(Ok(acp_v2::PromptResponse::new("retry")))
+            .expect("retry receipt should be pending");
+        cx.run_until_parked();
+        assert_eq!(turn_summaries(&thread_view, cx), vec![]);
+        report_state(
+            &thread,
+            json!({"state": "idle", "stopReason": "end_turn"}),
+            cx,
+        );
+
+        let record = turn_record(&thread_view, 0, cx).expect("the prompt should own its turn");
+        assert_eq!(record.outcome, turn_lifecycle::TurnOutcome::Finished);
+        assert_eq!(
+            turn_summaries(&thread_view, cx),
+            vec![(1, record.duration, false)]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_rejected_reported_retry_keeps_turn_stats(cx: &mut TestAppContext) {
+        let (connection, _conversation_view, thread_view, thread, cx) =
+            reported_retry_thread(false, cx).await;
+        let turn_stats = |cx: &mut VisualTestContext| {
+            thread_view.read_with(cx, |view, _| {
+                (
+                    view.turn_fields.last_turn_duration,
+                    view.turn_fields.last_turn_tokens,
+                    view.turn_fields.turn_generation,
+                )
+            })
+        };
+        let stats_before_retry = turn_stats(cx);
+        assert_eq!(stats_before_retry.1, Some(7));
+        let failed_turn = turn_record(&thread_view, 0, cx);
+
+        let reject = connection.defer_next_receipt_response();
+        thread_view.update(cx, |view, cx| view.retry_generation(cx));
+        cx.run_until_parked();
+        reject
+            .send(Err(anyhow!("retry rejected")))
+            .expect("retry receipt should be pending");
+        cx.run_until_parked();
+        assert_eq!(turn_stats(cx), stats_before_retry);
+
+        report_state(&thread, json!({"state": "running"}), cx);
+        report_state(
+            &thread,
+            json!({"state": "idle", "stopReason": "end_turn"}),
+            cx,
+        );
+        assert_eq!(turn_record(&thread_view, 0, cx), failed_turn);
+    }
+
+    #[gpui::test]
+    async fn test_subagent_threads_keep_their_turns_expanded(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let root =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root.read_with(cx, |thread, _| thread.session_id().clone());
+        let child = conversation_view.update(cx, |view, cx| {
+            create_test_acp_thread(
+                Some(root_session_id),
+                "child",
+                Rc::new(connection.clone()),
+                view.project.clone(),
+                cx,
+            )
+        });
+        root.update(cx, |root, cx| root.register_subagent(child.clone(), cx));
+        cx.run_until_parked();
+
+        child.update(cx, |child, cx| {
+            child.push_user_content_block(None, "Investigate".into(), cx);
+        });
+        apply_tool_call_updates(
+            &child,
+            [finished_read("read-1"), finished_read("read-2")],
+            cx,
+        );
+        child.update(cx, |child, cx| {
+            child
+                .handle_session_update(message_update("Done."), cx)
+                .expect("message update");
+        });
+        cx.run_until_parked();
+
+        let child_view = conversation_view.read_with(cx, |view, cx| {
+            view.thread_view(child.read(cx).session_id())
+                .expect("the child should have a view")
+        });
+        assert_eq!(turn_summaries(&child_view, cx), vec![]);
+        assert_eq!(
+            tool_call_group_layout(&child_view, cx),
+            (vec![(1, 2, false)], vec![1, 2])
+        );
+    }
+
+    #[gpui::test]
+    async fn test_pending_permission_request_keeps_its_turn_expanded(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.push_user_content_block(None, "Prompt".into(), cx);
+        });
+        apply_tool_call_updates(&thread, ["read-1", "asks"].map(finished_read), cx);
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(message_update("Done."), cx)
+                .expect("message update");
+        });
+        cx.run_until_parked();
+        assert_eq!(turn_summaries(&thread_view, cx), vec![(1, None, false)]);
+
+        let request = generic_permission_prompt(
+            &thread,
+            Some(json!({"type": "tool_call", "toolCall": {"toolCallId": "asks"}})),
+            cx,
+        );
+        let (request_id, response) = request_test_generic_permission(&thread, request, cx);
+        cx.run_until_parked();
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Idle
+        );
+        assert_eq!(turn_summaries(&thread_view, cx), vec![]);
+
+        click_generic_permission(request_id, Some("once"), cx);
+        assert_eq!(
+            response.await,
+            acp_v2::RequestPermissionOutcome::Selected(acp_v2::SelectedPermissionOutcome::new(
+                "once"
+            ))
+        );
+        assert_eq!(turn_summaries(&thread_view, cx), vec![(1, None, false)]);
+    }
+
+    #[gpui::test]
+    async fn test_message_navigation_skips_answers_hidden_in_collapsed_turns(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![
+            finished_read_update("read-1", "Read file"),
+            acp_v1::SessionUpdate::ToolCall(
+                acp_v1::ToolCall::new("ask-user-1", "Which directory should we explore?")
+                    .kind(acp_v1::ToolKind::Other)
+                    .status(acp_v1::ToolCallStatus::Completed)
+                    .meta(acp_thread::meta_with_tool_name("ask_user")),
+            ),
+        ]);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Prompt", cx))
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let response_task = thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation(
+                    acp_v2::CreateElicitationRequest::new(
+                        acp_v2::ElicitationFormMode::new(
+                            acp_v2::ElicitationSessionScope::new(session_id)
+                                .tool_call_id(acp_v2::ToolCallId::new("ask-user-1")),
+                            acp_v2::ElicitationSchema::new().string("other", true),
+                        ),
+                        "Which directory should we explore?",
+                    ),
+                    cx,
+                )
+                .expect("ask_user elicitation should be accepted")
+        });
+        let elicitation_id = thread
+            .read_with(cx, |thread, _| {
+                thread.entries().iter().find_map(|entry| match entry {
+                    AgentThreadEntry::Elicitation(id) => Some(id.clone()),
+                    _ => None,
+                })
+            })
+            .expect("elicitation entry should exist");
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_elicitation(
+                &elicitation_id,
+                acp_v2::CreateElicitationResponse::new(acp_v2::ElicitationAction::Accept(
+                    acp_v2::ElicitationAcceptAction::new().content(
+                        std::collections::BTreeMap::from([(
+                            "other".to_string(),
+                            acp_v2::ElicitationContentValue::from("delve into src"),
+                        )]),
+                    ),
+                )),
+                cx,
+            );
+        });
+        response_task.await;
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(message_update("Done."), cx)
+                .expect("message update");
+        });
+        cx.run_until_parked();
+        assert_eq!(turn_summaries(&thread_view, cx), vec![(1, None, false)]);
+
+        fn navigate(
+            thread_view: &Entity<ThreadView>,
+            from_ix: usize,
+            action: impl Action,
+            cx: &mut VisualTestContext,
+        ) -> usize {
+            thread_view.update_in(cx, |view, window, cx| {
+                view.list_state.scroll_to(ListOffset {
+                    item_ix: from_ix,
+                    offset_in_item: px(0.),
+                });
+                view.focus_handle(cx).focus(window, cx);
+            });
+            cx.dispatch_action(action);
+            cx.run_until_parked();
+            thread_view.read_with(cx, |view, _| view.list_state.logical_scroll_top().item_ix)
+        }
+        let scroll_to_latest_user_message = |cx: &mut VisualTestContext| {
+            thread_view.update(cx, |view, cx| {
+                view.scroll_to_user_message_index(None, cx);
+                view.list_state.logical_scroll_top().item_ix
+            })
+        };
+        assert_eq!(
+            navigate(&thread_view, 4, ScrollOutputToPreviousMessage, cx),
+            0
+        );
+        assert_eq!(navigate(&thread_view, 0, ScrollOutputToNextMessage, cx), 0);
+        assert_eq!(scroll_to_latest_user_message(cx), 0);
+
+        thread_view.update(cx, |view, cx| {
+            view.toggle_collapse(thread_collapse::CollapseKey::Turn(0), cx);
+            view.toggle_collapse(
+                thread_collapse::CollapseKey::ToolCalls(acp_v2::ToolCallId::new("read-1")),
+                cx,
+            );
+        });
+        assert_eq!(
+            navigate(&thread_view, 4, ScrollOutputToPreviousMessage, cx),
+            2
+        );
+        assert_eq!(navigate(&thread_view, 0, ScrollOutputToNextMessage, cx), 2);
+        assert_eq!(scroll_to_latest_user_message(cx), 2);
+    }
+
+    #[gpui::test]
+    async fn test_request_elicitations_recompute_turn_presentation(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let server = ReleaseRequestElicitationServer {
+            response: Arc::new(Mutex::new(None)),
+        };
+        let (conversation_view, cx) = setup_conversation_view(server, cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let store = conversation_view
+            .read_with(cx, |view, _| view.request_elicitation_connection())
+            .expect("connection")
+            .request_elicitations()
+            .expect("request elicitation store");
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Prompt", cx))
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+        for update in [
+            finished_read_update("read-1", "Read file"),
+            message_update("Done."),
+        ] {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .handle_session_update(update, cx)
+                    .expect("session update");
+            });
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            turn_summaries(&thread_view, cx),
+            vec![],
+            "a pending question keeps the turn open"
+        );
+
+        store.update(cx, |store, cx| store.clear(cx));
+        cx.run_until_parked();
+        assert_eq!(turn_summaries(&thread_view, cx).len(), 1);
+
+        let _pending_response = store.update(cx, |store, cx| {
+            store
+                .request_elicitation(
+                    acp_v2::CreateElicitationRequest::new(
+                        acp_v2::ElicitationFormMode::new(
+                            acp_v2::ElicitationRequestScope::new(acp_v1::RequestId::Number(2)),
+                            acp_v2::ElicitationSchema::new().string("name", true),
+                        ),
+                        "Provide a name",
+                    ),
+                    cx,
+                )
+                .expect("request-scoped elicitation should be accepted")
+        });
+        cx.run_until_parked();
+        assert_eq!(turn_summaries(&thread_view, cx), vec![]);
+    }
+
+    #[gpui::test]
+    async fn test_turn_summary_toggles_on_keyboard_and_click(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        connection.set_next_prompt_updates(vec![
+            finished_read_update("read-1", "Read file"),
+            finished_read_update("read-2", "Read file"),
+            finished_read_update("read-3", "Read file"),
+            message_update("Done."),
+        ]);
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Prompt", cx))
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+
+        let collapsed = (vec![(1, None, false)], vec![1, 2, 3]);
+        let expanded = (vec![(1, None, true)], vec![1, 2, 3]);
+        let layout = |cx: &mut VisualTestContext| {
+            (
+                turn_summaries(&thread_view, cx),
+                tool_call_group_layout(&thread_view, cx).1,
+            )
+        };
+        assert_eq!(layout(cx), collapsed);
+        assert!(cx.debug_bounds("turn-summary-0").is_some());
+        assert!(cx.debug_bounds("tool-call-group-1").is_none());
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.focus_handle(cx).focus(window, cx);
+            window.focus_next(cx);
+        });
+        for (key, expected) in [("enter", &expanded), ("space", &collapsed)] {
+            cx.simulate_keystrokes(key);
+            cx.simulate_event(gpui::KeyUpEvent {
+                keystroke: gpui::Keystroke::parse(key).expect("valid keystroke"),
+            });
+            cx.run_until_parked();
+            assert_eq!(&layout(cx), expected, "{key}");
+        }
+
+        let summary = cx
+            .debug_bounds("turn-summary-0")
+            .expect("turn summary should render");
+        cx.simulate_click(summary.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(layout(cx), expanded);
+        assert_eq!(
+            tool_call_group_layout(&thread_view, cx).0,
+            vec![(1, 3, false)]
+        );
+        assert!(cx.debug_bounds("tool-call-group-1").is_some());
+    }
+
+    #[gpui::test]
+    async fn test_thread_search_skips_collapsed_turns(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            set_collapse_finished_turns(true, cx);
+            AgentSettings::override_global(
+                AgentSettings {
+                    thinking_display: settings::ThinkingBlockDisplay::AlwaysExpanded,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        connection.set_next_prompt_updates(vec![
+            finished_read_update("read-1", "Read papaya"),
+            thought_update("Considering kiwi"),
+            message_update("Done."),
+        ]);
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Prompt", cx))
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+        assert_eq!(turn_summaries(&thread_view, cx), vec![(1, None, false)]);
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.toggle_search(&crate::ToggleSearch, window, cx);
+        });
+        let search_bar = thread_view
+            .read_with(cx, |view, _| view.thread_search_bar.clone())
+            .expect("search should be open");
+        let match_count = |query: &str, cx: &mut VisualTestContext| {
+            search_bar.update_in(cx, |bar, window, cx| {
+                bar.query_editor.update(cx, |editor, cx| {
+                    editor.set_text(query, window, cx);
+                });
+                bar.update_matches(window, cx);
+            });
+            cx.run_until_parked();
+            search_bar.read_with(cx, |bar, _| bar.match_count())
+        };
+        assert_eq!(match_count("papaya", cx), 0);
+        assert_eq!(match_count("kiwi", cx), 0);
+
+        thread_view.update(cx, |view, cx| {
+            view.toggle_collapse(thread_collapse::CollapseKey::Turn(0), cx);
+        });
+        assert_eq!(match_count("papaya", cx), 1);
+        assert_eq!(match_count("kiwi", cx), 1);
+    }
+
+    #[gpui::test]
+    async fn test_collapsing_a_turn_moves_the_scroll_position_to_its_summary(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let session_id =
+            thread_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+
+        send_prompt(&conversation_view, "Prompt", cx);
+        for update in [
+            message_update("Looking around."),
+            finished_read_update("read-1", "Read file"),
+            thought_update("Thinking it over."),
+            finished_read_update("read-2", "Read file"),
+            message_update("Done."),
+        ] {
+            cx.update(|_, cx| connection.send_update(session_id.clone(), update, cx));
+            cx.run_until_parked();
+        }
+        assert_eq!(turn_summaries(&thread_view, cx), vec![]);
+
+        thread_view.update(cx, |view, _cx| {
+            view.list_state.scroll_to(ListOffset {
+                item_ix: 3,
+                offset_in_item: px(0.),
+            });
+            assert!(!view.list_state.is_following_tail());
+        });
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+
+        assert_eq!(turn_summaries(&thread_view, cx).len(), 1);
+        assert_eq!(turn_summaries(&thread_view, cx)[0].0, 1);
+        thread_view.read_with(cx, |view, _| {
+            assert_eq!(view.list_state.logical_scroll_top().item_ix, 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_rewinding_drops_the_state_of_removed_turns(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+
+        for (prompt, tool_call_id) in [("First prompt", "read-1"), ("Second prompt", "read-2")] {
+            connection.set_next_prompt_updates(vec![
+                finished_read_update(tool_call_id, "Read file"),
+                message_update("Done."),
+            ]);
+            send_prompt(&conversation_view, prompt, cx);
+        }
+        thread_view.update(cx, |view, cx| {
+            view.toggle_collapse(thread_collapse::CollapseKey::Turn(3), cx);
+        });
+        let first_record = turn_record(&thread_view, 0, cx).expect("first turn record");
+        assert!(turn_record(&thread_view, 3, cx).is_some());
+        assert_eq!(
+            turn_summaries(&thread_view, cx),
+            vec![
+                (1, first_record.duration, false),
+                (
+                    4,
+                    turn_record(&thread_view, 3, cx).and_then(|record| record.duration),
+                    true
+                )
+            ]
+        );
+
+        let second_prompt_id = thread.read_with(cx, |thread, _| {
+            let Some(AgentThreadEntry::UserMessage(message)) = thread.entries().get(3) else {
+                panic!("expected the second prompt at entry 3");
+            };
+            message
+                .client_id
+                .clone()
+                .expect("prompt should have a client id")
+        });
+        thread
+            .update(cx, |thread, cx| thread.rewind(second_prompt_id, cx))
+            .await
+            .expect("rewind should succeed");
+        cx.run_until_parked();
+
+        assert_eq!(turn_record(&thread_view, 0, cx), Some(first_record));
+        assert_eq!(turn_record(&thread_view, 3, cx), None);
+        thread_view.read_with(cx, |view, cx| {
+            assert!(
+                !view
+                    .entry_view_state
+                    .read(cx)
+                    .is_expanded(&thread_collapse::CollapseKey::Turn(3))
+            );
+        });
+
+        connection.set_next_prompt_updates(vec![
+            acp_v1::SessionUpdate::ToolCall(
+                acp_v1::ToolCall::new("read-3".to_string(), "Read file")
+                    .kind(acp_v1::ToolKind::Read)
+                    .status(acp_v1::ToolCallStatus::Failed),
+            ),
+            message_update("Done again."),
+        ]);
+        send_prompt(&conversation_view, "Third prompt", cx);
+        let third_record = turn_record(&thread_view, 3, cx).expect("third turn record");
+        assert_eq!(
+            turn_summaries(&thread_view, cx),
+            vec![
+                (1, first_record.duration, false),
+                (4, third_record.duration, false)
+            ]
+        );
     }
 
     #[gpui::test]

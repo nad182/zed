@@ -1461,6 +1461,7 @@ mod test_support {
                     sessions: self.sessions.clone(),
                     next_receipt_response: self.next_receipt_response.clone(),
                     receipt_prompt: self.receipt_prompt.clone(),
+                    supports_retry: self.supports_retry,
                 }) as Rc<dyn ReceiptSessionSubmissions>
             })
         }
@@ -1556,6 +1557,17 @@ mod test_support {
         next_receipt_response:
             Arc<Mutex<Option<oneshot::Receiver<Result<acp_v2::PromptResponse>>>>>,
         receipt_prompt: Arc<Mutex<Option<Vec<acp_v2::ContentBlock>>>>,
+        supports_retry: bool,
+    }
+
+    impl StubReceiptSessionSubmissions {
+        fn next_receipt(&self, cx: &mut gpui::Context<AcpThread>) -> ReceiptSubmission {
+            match self.next_receipt_response.lock().take() {
+                Some(receiver) => cx.spawn(async move |_, _| Ok(receiver.await??)),
+                None => Task::ready(Err(anyhow::Error::msg("No deferred receipt response"))),
+            }
+            .into()
+        }
     }
 
     impl ReceiptSessionSubmissions for StubReceiptSessionSubmissions {
@@ -1568,11 +1580,15 @@ mod test_support {
                 return Task::ready(Err(anyhow::Error::msg("Unknown receipt session"))).into();
             }
             *self.receipt_prompt.lock() = Some(content);
-            match self.next_receipt_response.lock().take() {
-                Some(receiver) => cx.spawn(async move |_, _| Ok(receiver.await??)),
-                None => Task::ready(Err(anyhow::Error::msg("No deferred receipt response"))),
-            }
-            .into()
+            self.next_receipt(cx)
+        }
+
+        fn supports_retry(&self) -> bool {
+            self.supports_retry
+        }
+
+        fn retry(&self, cx: &mut gpui::Context<AcpThread>) -> ReceiptSubmission {
+            self.next_receipt(cx)
         }
     }
 
