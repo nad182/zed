@@ -148,8 +148,8 @@ fn agent_image_lookup(
         .collect();
 
     // Only the first candidate may skip the ordered disk lookup, and only as an absolute, plain
-    // path with a file entry; otherwise the index can pick a different file than the filesystem
-    // (gitignored or deleted files, `~`, a `.` segment or a trailing separator).
+    // path to a non-symlink file entry; otherwise the index can pick a different file than the
+    // filesystem (gitignored or deleted files, dangling symlinks, `~`, `.` or a trailing `/`).
     let first_path = paths.first()?;
     let is_plain_path = first_path.to_str().is_some_and(|path| {
         !path.ends_with(path_style.separators_ch())
@@ -163,7 +163,7 @@ fn agent_image_lookup(
         .filter(|project_path| {
             project
                 .entry_for_path(project_path, cx)
-                .is_some_and(|entry| entry.is_file())
+                .is_some_and(|entry| entry.is_file() && entry.canonical_path.is_none())
         })
     else {
         return Some(AgentImageLookup::Disk(paths));
@@ -1231,6 +1231,56 @@ mod tests {
                 "{dest_url}"
             );
         }
+    }
+
+    #[gpui::test]
+    async fn test_agent_image_lookup_keeps_suffix_of_root_prefixed_paths(cx: &mut TestAppContext) {
+        let project = image_test_project(
+            json!({"shot.svg": "<svg/>", "project": {"shot.svg": {"%2e": "<svg/>"}}}),
+            cx,
+        )
+        .await;
+        let paths = disk_paths(lookup("project/shot.svg/%2e", &project, cx))
+            .expect("a path ending in `/.` must not take the indexed shortcut");
+        assert!(
+            paths[0].to_str().unwrap().ends_with("shot.svg/."),
+            "{paths:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_agent_image_lookup_checks_symlinks_on_disk(cx: &mut TestAppContext) {
+        crate::test_support::init_test(cx);
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/outside"), json!({"target.svg": "<svg/>"}))
+            .await;
+        fs.insert_tree(path!("/one"), json!({})).await;
+        fs.insert_symlink(
+            path!("/one/link.svg"),
+            PathBuf::from(path!("/outside/target.svg")),
+        )
+        .await;
+        fs.insert_tree(path!("/two"), json!({"link.svg": "<svg/>"}))
+            .await;
+        let project = Project::test(
+            fs.clone(),
+            [path!("/one").as_ref(), path!("/two").as_ref()],
+            cx,
+        )
+        .await;
+        cx.run_until_parked();
+        fs.remove_file(Path::new(path!("/outside/target.svg")), Default::default())
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            disk_paths(lookup("link.svg", &project, cx)),
+            Some(vec![
+                PathBuf::from(path!("/one/link.svg")),
+                PathBuf::from(path!("/two/link.svg")),
+            ])
+        );
     }
 
     #[gpui::test]

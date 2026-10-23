@@ -5208,7 +5208,7 @@ impl Project {
             .flat_map(|worktree| {
                 let worktree = worktree.read(cx);
                 [
-                    path.strip_prefix(worktree.root_name().as_std_path()).ok(),
+                    strip_root_name(path, worktree.root_name_str(), path_style),
                     Some(path),
                 ]
                 .into_iter()
@@ -7443,6 +7443,18 @@ fn hovered_debug_expression(
     hovered_debug_variable_expression(snapshot, position)
         .or_else(|| hovered_debug_member_expression(snapshot, position))
         .or_else(|| hovered_debug_identifier_expression(snapshot, position))
+}
+
+// `Path::strip_prefix` rebuilds the remainder from components, which drops a trailing `/.`
+// and so can point at a different file.
+fn strip_root_name<'a>(path: &'a Path, root_name: &str, path_style: PathStyle) -> Option<&'a Path> {
+    let Some(path_text) = path.to_str() else {
+        return path.strip_prefix(root_name).ok();
+    };
+    let remainder = path_text
+        .strip_prefix(root_name)?
+        .strip_prefix(path_style.separators_ch())?;
+    Some(Path::new(remainder))
 }
 
 fn hovered_debug_identifier_expression(
