@@ -710,12 +710,11 @@ impl EntryViewState {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let is_generating = matches!(thread.status(), ThreadStatus::Generating);
         layout(LayoutInput {
             kinds: &kinds,
             tool_call_ids: &tool_call_ids,
-            tail_is_growing: is_generating,
-            last_turn_is_live: is_generating || last_turn_is_live_hint,
+            tail_is_growing: matches!(thread.status(), ThreadStatus::Generating),
+            last_turn_is_live: thread.status() != ThreadStatus::Idle || last_turn_is_live_hint,
             turn_records: &self.turn_records,
             expanded: &self.expanded,
         })

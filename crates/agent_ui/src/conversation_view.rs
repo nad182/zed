@@ -13361,6 +13361,32 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_unconfirmed_last_turn_stays_expanded(cx: &mut TestAppContext) {
+        let (_conversation_view, thread_view, thread, cx) = reported_activity_thread(cx).await;
+        thread.update(cx, |thread, cx| thread.mark_activity_unconfirmed(cx));
+        thread.update(cx, |thread, cx| {
+            thread
+                .upsert_user_message(
+                    acp_v2::UserMessage::new("restored").content(vec!["Restored".into()]),
+                    cx,
+                )
+                .expect("restored user message");
+        });
+        cx.run_until_parked();
+        apply_tool_call_updates(&thread, [finished_read("read-restored")], cx);
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(message_update("Done."), cx)
+                .expect("message update");
+        });
+        cx.run_until_parked();
+        assert_eq!(turn_summaries(&thread_view, cx), vec![]);
+
+        report_state(&thread, json!({"state": "idle"}), cx);
+        assert_eq!(turn_summaries(&thread_view, cx), vec![(1, None, false)]);
+    }
+
+    #[gpui::test]
     async fn test_unknown_activity_does_not_start_a_turn(cx: &mut TestAppContext) {
         let (_conversation_view, thread_view, thread, cx) = reported_activity_thread(cx).await;
         thread.update(cx, |thread, cx| {
