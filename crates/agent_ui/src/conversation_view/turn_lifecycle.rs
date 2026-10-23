@@ -19,7 +19,8 @@ impl TurnOutcome {
                 acp_v2::StopReason::Cancelled
                 | acp_v2::StopReason::MaxTokens
                 | acp_v2::StopReason::MaxTurnRequests
-                | acp_v2::StopReason::Refusal,
+                | acp_v2::StopReason::Refusal
+                | acp_v2::StopReason::Error(_),
             ) => Self::Interrupted,
             _ => Self::Unknown,
         }
@@ -209,6 +210,7 @@ mod tests {
             StopReason::MaxTokens,
             StopReason::MaxTurnRequests,
             StopReason::Refusal,
+            StopReason::Error(acp_v2::ErrorStopReason::new()),
         ] {
             assert_eq!(
                 TurnOutcome::from_stop_reason(Some(&stop_reason)),

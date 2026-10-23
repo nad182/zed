@@ -13313,6 +13313,25 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_reported_error_keeps_turn_expanded(cx: &mut TestAppContext) {
+        let (_conversation_view, thread_view, thread, cx) = reported_activity_thread(cx).await;
+        run_reported_prompt(&thread, "Prompt", cx);
+        let _no_transient_summary =
+            assert_no_turn_summary_on_presentation_change(&thread_view, "error".to_string(), cx);
+        report_state(
+            &thread,
+            json!({"state": "idle", "stopReason": "error", "error": {"code": -32603, "message": "Internal error"}}),
+            cx,
+        );
+
+        assert_eq!(
+            turn_record(&thread_view, 0, cx).map(|record| record.outcome),
+            Some(turn_lifecycle::TurnOutcome::Interrupted)
+        );
+        assert_eq!(turn_summaries(&thread_view, cx), vec![]);
+    }
+
+    #[gpui::test]
     async fn test_unconfirmed_gap_keeps_live_reported_turn(cx: &mut TestAppContext) {
         let (_conversation_view, thread_view, thread, cx) = reported_activity_thread(cx).await;
         run_reported_prompt(&thread, "Prompt", cx);
