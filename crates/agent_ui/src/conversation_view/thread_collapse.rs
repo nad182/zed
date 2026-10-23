@@ -1,15 +1,16 @@
 use std::{ops::Range, time::Duration};
 
 use acp_thread::{
-    AcpThread, AgentThreadEntry, AssistantMessageChunk, ElicitationStatus, ToolCall,
-    ToolCallContent, ToolCallStatus,
+    AcpThread, AgentThreadEntry, AssistantMessageChunk, ElicitationStatus, PermissionRequest,
+    ToolCall, ToolCallContent, ToolCallStatus,
 };
-use agent_client_protocol::schema::v1 as acp_v1;
+use agent_client_protocol::schema::v2 as acp_v2;
 use collections::{HashMap, HashSet};
 use gpui::App;
 use util::time::duration_alt_display;
 
 use super::STOPWATCH_THRESHOLD;
+use super::ThreadView;
 use super::elicitation::should_render_elicitation;
 use super::turn_lifecycle::{TurnOutcome, TurnRecord};
 use crate::completion_provider::pluralize;
@@ -23,6 +24,7 @@ pub(crate) enum EntryKind {
     Thinking { blocks: usize },
     ToolCall { groupable: bool, renders: bool },
     NeedsAction,
+    SessionMessage,
     Aside,
     Invisible,
 }
@@ -30,7 +32,7 @@ pub(crate) enum EntryKind {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum CollapseKey {
     Turn(usize),
-    ToolCalls(acp_v1::ToolCallId),
+    ToolCalls(acp_v2::ToolCallId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,7 +95,7 @@ impl EntryPresentation {
 
 pub(crate) struct LayoutInput<'a> {
     pub kinds: &'a [EntryKind],
-    pub tool_call_ids: &'a [Option<acp_v1::ToolCallId>],
+    pub tool_call_ids: &'a [Option<acp_v2::ToolCallId>],
     pub tail_is_growing: bool,
     pub last_turn_is_live: bool,
     pub turn_records: &'a HashMap<usize, TurnRecord>,
@@ -228,6 +230,7 @@ fn steps(kinds: &[EntryKind]) -> usize {
             EntryKind::ToolCall { renders: false, .. }
             | EntryKind::UserMessage
             | EntryKind::NeedsAction
+            | EntryKind::SessionMessage
             | EntryKind::Aside
             | EntryKind::Invisible => 0,
         })
@@ -314,7 +317,7 @@ pub(crate) fn entry_kind(entry: &AgentThreadEntry, thread: &AcpThread, cx: &App)
                 EntryKind::Invisible
             }
         }
-        AgentThreadEntry::ToolCall(tool_call) if tool_call.authorization().is_some() => {
+        AgentThreadEntry::ToolCall(tool_call) if awaits_permission(tool_call, thread) => {
             EntryKind::NeedsAction
         }
         AgentThreadEntry::ToolCall(tool_call) => EntryKind::ToolCall {
@@ -331,7 +334,17 @@ pub(crate) fn entry_kind(entry: &AgentThreadEntry, thread: &AcpThread, cx: &App)
             _ => EntryKind::Invisible,
         },
         AgentThreadEntry::ContextCompaction(_) => EntryKind::Aside,
+        AgentThreadEntry::SessionMessage(_) => EntryKind::SessionMessage,
     }
+}
+
+fn awaits_permission(tool_call: &ToolCall, thread: &AcpThread) -> bool {
+    tool_call.authorization_id().is_some()
+        || thread
+            .pending_permission_requests()
+            .filter_map(PermissionRequest::generic_request)
+            .filter_map(|request| ThreadView::permission_tool_call(thread, request))
+            .any(|(_, subject)| subject.id == tool_call.id)
 }
 
 fn tool_call_is_groupable(tool_call: &ToolCall) -> bool {
@@ -367,7 +380,7 @@ pub(super) fn tool_call_renders_nothing(tool_call: &ToolCall, cx: &App) -> bool 
 
 #[cfg(test)]
 mod tests {
-    use super::EntryKind::{Aside, Invisible, NeedsAction, UserMessage};
+    use super::EntryKind::{Aside, Invisible, NeedsAction, SessionMessage, UserMessage};
     use super::*;
 
     const TEXT: EntryKind = EntryKind::Answer { thinking_blocks: 0 };
@@ -386,8 +399,8 @@ mod tests {
         renders: false,
     };
 
-    fn tool_call_id(entry_ix: usize) -> acp_v1::ToolCallId {
-        acp_v1::ToolCallId::new(format!("tool-{entry_ix}"))
+    fn tool_call_id(entry_ix: usize) -> acp_v2::ToolCallId {
+        acp_v2::ToolCallId::new(format!("tool-{entry_ix}"))
     }
 
     struct Scenario<'a> {
@@ -581,7 +594,15 @@ mod tests {
 
     #[test]
     fn diffs_and_other_visible_entries_end_runs() {
-        for barrier in [UserMessage, TEXT, THOUGHT, DIFF, NeedsAction, Aside] {
+        for barrier in [
+            UserMessage,
+            TEXT,
+            THOUGHT,
+            DIFF,
+            NeedsAction,
+            SessionMessage,
+            Aside,
+        ] {
             let kinds = [TOOL, barrier, TOOL];
             assert_eq!(collapsed(&kinds, false), vec![full(); 3], "{barrier:?}");
         }
