@@ -1,13 +1,14 @@
 use std::ops::Range;
 
 use acp_thread::{
-    AcpThread, AgentThreadEntry, AssistantMessageChunk, ElicitationStatus, ToolCall,
-    ToolCallContent, ToolCallStatus,
+    AcpThread, AgentThreadEntry, AssistantMessageChunk, ElicitationStatus, PermissionRequest,
+    ToolCall, ToolCallContent, ToolCallStatus,
 };
 use agent_client_protocol::schema::v2 as acp_v2;
 use collections::HashSet;
 use gpui::App;
 
+use super::ThreadView;
 use super::elicitation::should_render_elicitation;
 
 const MIN_TOOL_CALLS_PER_GROUP: usize = 2;
@@ -153,7 +154,7 @@ pub(crate) fn entry_kind(entry: &AgentThreadEntry, thread: &AcpThread, cx: &App)
                 EntryKind::Invisible
             }
         }
-        AgentThreadEntry::ToolCall(tool_call) if tool_call.authorization_id().is_some() => {
+        AgentThreadEntry::ToolCall(tool_call) if awaits_permission(tool_call, thread) => {
             EntryKind::NeedsAction
         }
         AgentThreadEntry::ToolCall(tool_call) => EntryKind::ToolCall {
@@ -172,6 +173,15 @@ pub(crate) fn entry_kind(entry: &AgentThreadEntry, thread: &AcpThread, cx: &App)
         AgentThreadEntry::ContextCompaction(_) => EntryKind::Aside,
         AgentThreadEntry::SessionMessage(_) => EntryKind::Answer,
     }
+}
+
+fn awaits_permission(tool_call: &ToolCall, thread: &AcpThread) -> bool {
+    tool_call.authorization_id().is_some()
+        || thread
+            .pending_permission_requests()
+            .filter_map(PermissionRequest::generic_request)
+            .filter_map(|request| ThreadView::permission_tool_call(thread, request))
+            .any(|(_, subject)| subject.id == tool_call.id)
 }
 
 fn tool_call_is_groupable(tool_call: &ToolCall) -> bool {

@@ -12969,6 +12969,48 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_tool_call_with_pending_permission_request_splits_its_group(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        apply_tool_call_updates(
+            &thread,
+            ["read-1", "read-2", "asks", "read-3", "read-4"].map(finished_read),
+            cx,
+        );
+        let one_group = (vec![(0, 5, false)], vec![0, 1, 2, 3, 4]);
+        assert_eq!(tool_call_group_layout(&thread_view, cx), one_group);
+
+        let request = generic_permission_prompt(
+            &thread,
+            Some(json!({"type": "tool_call", "toolCall": {"toolCallId": "asks"}})),
+            cx,
+        );
+        let (request_id, response) = request_test_generic_permission(&thread, request, cx);
+        cx.run_until_parked();
+        assert_eq!(
+            tool_call_group_layout(&thread_view, cx),
+            (vec![(0, 2, false), (3, 2, false)], vec![0, 1, 3, 4])
+        );
+        assert!(cx.debug_bounds("tool-call-asks-standalone").is_some());
+
+        click_generic_permission(request_id, Some("once"), cx);
+        assert_eq!(
+            response.await,
+            acp_v2::RequestPermissionOutcome::Selected(acp_v2::SelectedPermissionOutcome::new(
+                "once"
+            ))
+        );
+        assert_eq!(tool_call_group_layout(&thread_view, cx), one_group);
+    }
+
+    #[gpui::test]
     async fn test_awaiting_authorization_searches_visible_patch_content(cx: &mut TestAppContext) {
         use agent_client_protocol::schema::v2 as acp_v2;
 

@@ -4288,7 +4288,7 @@ impl ThreadView {
             .collect()
     }
 
-    fn permission_tool_call<'a>(
+    pub(super) fn permission_tool_call<'a>(
         thread: &'a AcpThread,
         request: &acp_v2::RequestPermissionRequest,
     ) -> Option<(usize, &'a ToolCall)> {
