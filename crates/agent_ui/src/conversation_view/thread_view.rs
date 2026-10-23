@@ -2778,12 +2778,18 @@ impl ThreadView {
     pub fn retry_generation(&mut self, cx: &mut Context<Self>) {
         self.thread_error.take();
 
-        if !self.thread.read(cx).can_retry(cx) {
+        let thread = &self.thread;
+        if !thread.read(cx).can_retry(cx) {
             return;
         }
 
-        let owner = self.turn_fields.turn_lifecycle.retry_owner();
-        let generation = self.start_turn(owner, cx);
+        let generation = if thread.read(cx).uses_reported_activity() {
+            self.turn_fields.turn_lifecycle.expect_retry();
+            None
+        } else {
+            let owner = self.turn_fields.turn_lifecycle.retry_owner();
+            Some(self.start_turn(owner, cx))
+        };
         let task = self.thread.update(cx, |thread, cx| thread.retry(cx));
         let submission_id = task.id;
         self.current_submission = Some(submission_id);
@@ -2794,7 +2800,7 @@ impl ThreadView {
             let result = task.await;
 
             this.update(cx, |this, cx| {
-                this.stop_turn(generation, cx);
+                this.settle_retried_turn(generation, result.is_ok(), cx);
                 if this.current_submission != Some(submission_id) {
                     return;
                 }
@@ -2808,6 +2814,24 @@ impl ThreadView {
             })
         })
         .detach();
+    }
+
+    fn settle_retried_turn(
+        &mut self,
+        generation: Option<usize>,
+        succeeded: bool,
+        cx: &mut Context<Self>,
+    ) {
+        match generation {
+            Some(generation) => {
+                if !succeeded && self.turn_fields.turn_generation == generation {
+                    self.interrupt_turn();
+                }
+                self.stop_turn(generation, cx);
+            }
+            None if !succeeded => self.turn_fields.turn_lifecycle.cancel_retry(),
+            None => {}
+        }
     }
 
     pub fn regenerate(

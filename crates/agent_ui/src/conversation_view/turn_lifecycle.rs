@@ -53,6 +53,7 @@ pub(crate) struct TurnLifecycle {
     reported_duration: Option<Duration>,
     last_recorded_owner: TurnOwner,
     reported_activity_generation: Option<u64>,
+    pending_retry_owner: Option<TurnOwner>,
 }
 
 impl TurnLifecycle {
@@ -95,11 +96,20 @@ impl TurnLifecycle {
             self.newest_owned_user_message_ix
                 .is_none_or(|newest| user_message_ix > newest)
         });
+        let pending_retry_owner = self.pending_retry_owner.take();
         let owner = match unowned_user_message_ix {
             Some(user_message_ix) => TurnOwner::UserMessage(user_message_ix),
-            None => TurnOwner::NextUserMessage,
+            None => pending_retry_owner.unwrap_or(TurnOwner::NextUserMessage),
         };
         self.start(owner, previous_elapsed)
+    }
+
+    pub(crate) fn expect_retry(&mut self) {
+        self.pending_retry_owner = Some(self.last_recorded_owner);
+    }
+
+    pub(crate) fn cancel_retry(&mut self) {
+        self.pending_retry_owner = None;
     }
 
     pub(crate) fn user_message_pushed(&mut self, entry_ix: usize) {
@@ -156,7 +166,11 @@ impl TurnLifecycle {
     }
 
     pub(crate) fn remove(&mut self, removed: &Range<usize>) {
-        for owner in [&mut self.owner, &mut self.last_recorded_owner] {
+        let pending_retry_owner = self.pending_retry_owner.as_mut();
+        for owner in [&mut self.owner, &mut self.last_recorded_owner]
+            .into_iter()
+            .chain(pending_retry_owner)
+        {
             if let TurnOwner::UserMessage(user_message_ix) = *owner {
                 *owner = reindex_after_removal(user_message_ix, removed)
                     .map_or(TurnOwner::None, TurnOwner::UserMessage);
@@ -175,7 +189,8 @@ impl TurnLifecycle {
     fn claim(&mut self, owner: TurnOwner) {
         self.owner = owner;
         if let TurnOwner::UserMessage(user_message_ix) = owner {
-            self.newest_owned_user_message_ix = Some(user_message_ix);
+            self.newest_owned_user_message_ix =
+                self.newest_owned_user_message_ix.max(Some(user_message_ix));
         }
     }
 
@@ -362,6 +377,38 @@ mod tests {
         assert_eq!(lifecycle.retry_owner(), TurnOwner::UserMessage(3));
         lifecycle.remove(&(3..4));
         assert_eq!(lifecycle.retry_owner(), TurnOwner::None);
+    }
+
+    #[test]
+    fn reported_retries_resume_the_owner_of_the_last_recorded_turn() {
+        let mut lifecycle = TurnLifecycle::default();
+        lifecycle.start_reported(1, Some(0), None);
+        lifecycle.interrupt();
+        lifecycle.record(None);
+
+        lifecycle.expect_retry();
+        lifecycle.start_reported(2, Some(0), None);
+        lifecycle.finish(Some(&StopReason::EndTurn), None);
+        assert_eq!(
+            lifecycle
+                .record(None)
+                .map(|(owner, record)| (owner, record.outcome)),
+            Some((0, TurnOutcome::Finished))
+        );
+
+        lifecycle.expect_retry();
+        lifecycle.cancel_retry();
+        lifecycle.start_reported(3, Some(0), None);
+        assert_eq!(owner_ix(lifecycle.record(None)), None);
+
+        lifecycle.expect_retry();
+        lifecycle.start_reported(4, Some(2), None);
+        assert_eq!(owner_ix(lifecycle.record(None)), Some(2));
+
+        lifecycle.expect_retry();
+        lifecycle.remove(&(2..4));
+        lifecycle.start_reported(5, Some(1), None);
+        assert_eq!(owner_ix(lifecycle.record(None)), None);
     }
 
     #[test]

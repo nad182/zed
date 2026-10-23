@@ -13625,7 +13625,6 @@ pub(crate) mod tests {
     struct FailThenRetryConnection {
         thread: Arc<Mutex<Option<WeakEntity<AcpThread>>>>,
         prompt_count: Arc<Mutex<usize>>,
-        failing_prompt_ix: usize,
         pending_retry: Arc<
             Mutex<Option<futures::channel::oneshot::Sender<gpui::Result<acp_v1::PromptResponse>>>>,
         >,
@@ -13709,7 +13708,7 @@ pub(crate) mod tests {
                 *prompt_count += 1;
                 *prompt_count - 1
             };
-            if prompt_ix == self.failing_prompt_ix {
+            if prompt_ix == 0 {
                 return Task::ready(Err(anyhow!("prompt failed")));
             }
             self.answer(
@@ -13787,9 +13786,33 @@ pub(crate) mod tests {
 
     #[gpui::test]
     async fn test_successful_retry_finishes_the_failed_turn(cx: &mut TestAppContext) {
-        let (connection, _conversation_view, thread_view, cx) = retry_failed_prompt(cx).await;
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let connection = StubAgentConnection::new().with_retry();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let session_id =
+            thread_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        let fail = connection.defer_next_prompt_response();
 
-        connection.finish_retry(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)));
+        send_prompt(&conversation_view, "Prompt", cx);
+        for update in [
+            finished_read_update("read-1", "Read file"),
+            message_update("Partial answer"),
+        ] {
+            cx.update(|_, cx| connection.send_update(session_id.clone(), update, cx));
+            cx.run_until_parked();
+        }
+        fail.send(Err(anyhow!("prompt failed")))
+            .expect("prompt response should be pending");
+        cx.run_until_parked();
+        assert_eq!(
+            turn_record(&thread_view, 0, cx).map(|record| record.outcome),
+            Some(turn_lifecycle::TurnOutcome::Interrupted)
+        );
+
+        thread_view.update(cx, |view, cx| view.retry_generation(cx));
         cx.run_until_parked();
 
         let record = turn_record(&thread_view, 0, cx).expect("the prompt should own its turn");
@@ -13855,22 +13878,25 @@ pub(crate) mod tests {
     ) {
         init_test(cx);
         cx.update(|cx| set_collapse_finished_turns(true, cx));
-        let connection = FailThenRetryConnection {
-            failing_prompt_ix: 1,
-            ..FailThenRetryConnection::default()
-        };
+        let connection = StubAgentConnection::new().with_retry();
         let (conversation_view, cx) =
             setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
         let thread_view = active_thread(&conversation_view, cx);
 
+        connection.set_next_prompt_updates(vec![
+            finished_read_update("read-1", "Read file"),
+            message_update("Answer."),
+        ]);
         send_prompt(&conversation_view, "Prompt", cx);
         let record = turn_record(&thread_view, 0, cx).expect("the prompt should own its turn");
         assert_eq!(record.outcome, turn_lifecycle::TurnOutcome::Finished);
 
+        let fail = connection.defer_next_prompt_response();
         send_native_command(&thread_view, cx);
-        thread_view.update(cx, |view, cx| view.retry_generation(cx));
+        fail.send(Err(anyhow!("command failed")))
+            .expect("command response should be pending");
         cx.run_until_parked();
-        connection.finish_retry(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)));
+        thread_view.update(cx, |view, cx| view.retry_generation(cx));
         cx.run_until_parked();
 
         assert_eq!(turn_record(&thread_view, 0, cx), Some(record));
@@ -13878,6 +13904,104 @@ pub(crate) mod tests {
             turn_summaries(&thread_view, cx),
             vec![(1, record.duration, false)]
         );
+    }
+
+    async fn reported_retry_thread(
+        collapse_finished_turns: bool,
+        cx: &mut TestAppContext,
+    ) -> (
+        StubAgentConnection,
+        Entity<ConversationView>,
+        Entity<ThreadView>,
+        Entity<AcpThread>,
+        &mut VisualTestContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(collapse_finished_turns, cx));
+        let connection = StubAgentConnection::new()
+            .with_receipt_submissions(true)
+            .with_retry();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        run_reported_prompt(&thread, "Prompt", cx);
+        report_state(
+            &thread,
+            json!({
+                "state": "idle", "stopReason": "error",
+                "usage": {"totalTokens": 12, "inputTokens": 5, "outputTokens": 7}
+            }),
+            cx,
+        );
+        assert_eq!(
+            turn_record(&thread_view, 0, cx).map(|record| record.outcome),
+            Some(turn_lifecycle::TurnOutcome::Interrupted)
+        );
+        (connection, conversation_view, thread_view, thread, cx)
+    }
+
+    #[gpui::test]
+    async fn test_reported_retry_finishes_the_failed_turn(cx: &mut TestAppContext) {
+        let (connection, _conversation_view, thread_view, thread, cx) =
+            reported_retry_thread(true, cx).await;
+
+        let accept = connection.defer_next_receipt_response();
+        thread_view.update(cx, |view, cx| view.retry_generation(cx));
+        cx.run_until_parked();
+        report_state(&thread, json!({"state": "running"}), cx);
+        accept
+            .send(Ok(acp_v2::PromptResponse::new("retry")))
+            .expect("retry receipt should be pending");
+        cx.run_until_parked();
+        assert_eq!(turn_summaries(&thread_view, cx), vec![]);
+        report_state(
+            &thread,
+            json!({"state": "idle", "stopReason": "end_turn"}),
+            cx,
+        );
+
+        let record = turn_record(&thread_view, 0, cx).expect("the prompt should own its turn");
+        assert_eq!(record.outcome, turn_lifecycle::TurnOutcome::Finished);
+        assert_eq!(
+            turn_summaries(&thread_view, cx),
+            vec![(1, record.duration, false)]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_rejected_reported_retry_keeps_turn_stats(cx: &mut TestAppContext) {
+        let (connection, _conversation_view, thread_view, thread, cx) =
+            reported_retry_thread(false, cx).await;
+        let turn_stats = |cx: &mut VisualTestContext| {
+            thread_view.read_with(cx, |view, _| {
+                (
+                    view.turn_fields.last_turn_duration,
+                    view.turn_fields.last_turn_tokens,
+                    view.turn_fields.turn_generation,
+                )
+            })
+        };
+        let stats_before_retry = turn_stats(cx);
+        assert_eq!(stats_before_retry.1, Some(7));
+        let failed_turn = turn_record(&thread_view, 0, cx);
+
+        let reject = connection.defer_next_receipt_response();
+        thread_view.update(cx, |view, cx| view.retry_generation(cx));
+        cx.run_until_parked();
+        reject
+            .send(Err(anyhow!("retry rejected")))
+            .expect("retry receipt should be pending");
+        cx.run_until_parked();
+        assert_eq!(turn_stats(cx), stats_before_retry);
+
+        report_state(&thread, json!({"state": "running"}), cx);
+        report_state(
+            &thread,
+            json!({"state": "idle", "stopReason": "end_turn"}),
+            cx,
+        );
+        assert_eq!(turn_record(&thread_view, 0, cx), failed_turn);
     }
 
     #[gpui::test]
