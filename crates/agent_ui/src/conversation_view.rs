@@ -12893,6 +12893,48 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_thread_search_skips_expanded_tool_output_inside_collapsed_groups(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| set_collapse_finished_turns(true, cx));
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        apply_tool_call_updates(
+            &thread,
+            [
+                finished_read("read-1"),
+                json!({
+                    "toolCallId": "inspect",
+                    "title": "Inspect output",
+                    "kind": "other",
+                    "status": "completed",
+                    "content": [{"type": "content", "content": {"type": "text", "text": "Tool output mentions papaya once."}}]
+                }),
+            ],
+            cx,
+        );
+        thread_view.update(cx, |view, cx| {
+            view.entry_view_state.update(cx, |state, _cx| {
+                state.expand_tool_call(acp_v2::ToolCallId::new("inspect"));
+            });
+        });
+        let search_bar = search_thread(&thread_view, "papaya", cx);
+        assert_eq!(settled_match_count(&search_bar, cx), 0);
+
+        thread_view.update(cx, |view, cx| {
+            view.toggle_collapse(
+                thread_collapse::CollapseKey::ToolCalls(acp_v2::ToolCallId::new("read-1")),
+                cx,
+            );
+        });
+        assert_eq!(settled_match_count(&search_bar, cx), 1);
+    }
+
+    #[gpui::test]
     async fn test_removing_entries_drops_their_tool_call_group_presentation(
         cx: &mut TestAppContext,
     ) {
